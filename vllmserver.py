@@ -57,6 +57,28 @@ def get_model_config(model_path: Path):
             return None
     return None
 
+def is_gguf_model(model_name: str) -> bool:
+    """Check if the model is a GGUF model"""
+    return "gguf" in model_name.lower()
+
+def get_gguf_file_path(model_path: Path) -> Path:
+    """Get the path to the GGUF file (must be exactly one)"""
+    gguf_files = list(model_path.glob("*.gguf"))
+    if len(gguf_files) != 1:
+        raise ValueError(f"Expected exactly 1 GGUF file, found {len(gguf_files)}: {[f.name for f in gguf_files]}")
+    return gguf_files[0]
+
+def check_gguf_model(model_path: Path):
+    """Check GGUF model and get info"""
+    try:
+        gguf_file = get_gguf_file_path(model_path)
+        size_gb = gguf_file.stat().st_size / 1e9
+        print(f"📊 Found GGUF model file: {gguf_file.name} ({size_gb:.2f} GB)")
+        return True, 1, [gguf_file.name], size_gb
+    except Exception as e:
+        print(f"❌ GGUF model check failed: {e}")
+        return False, 0, [], 0
+
 def setup_chat_template(model_path: Path, model_name: str):
     """Set up chat template for models that don't have one"""
     tokenizer_config_path = model_path / "tokenizer_config.json"
@@ -285,8 +307,29 @@ def get_gpu_config(model_name: str):
     """Get appropriate GPU configuration based on model size"""
     model_name_lower = model_name.lower()
     
+    # GGUF MoE models (special handling)
+    if is_gguf_model(model_name):
+        if "moe" in model_name_lower or "8x3b" in model_name_lower:
+            if "18b" in model_name_lower or "18.4b" in model_name_lower:
+                return "H100", 0.75  # 18.4B MoE GGUF needs H100
+            elif "14b" in model_name_lower:
+                return "H100", 0.80  # 14B MoE GGUF
+            elif "7b" in model_name_lower or "8b" in model_name_lower:
+                return "L40S", 0.75  # 7-8B MoE GGUF
+        # Regular GGUF models
+        elif "34b" in model_name_lower:
+            return "H200", 0.70  # 34B GGUF
+        elif "13b" in model_name_lower or "14b" in model_name_lower:
+            return "A100-80GB", 0.75  # 13-14B GGUF
+        elif "7b" in model_name_lower or "8b" in model_name_lower:
+            return "L40S", 0.75  # 7-8B GGUF
+        elif "3b" in model_name_lower:
+            return "A10G", 0.75  # 3B GGUF
+        else:
+            return "L4", 0.75  # Small GGUF models
+    
     # Massive models (70B+ parameters)
-    if any(size in model_name_lower for size in ["70b", "72b", "405b"]):
+    elif any(size in model_name_lower for size in ["70b", "72b", "405b"]):
         if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq", "bnb"]):
             if "405b" in model_name_lower:
                 return "B200", 0.90  # 405B quantized needs B200
@@ -395,10 +438,14 @@ def get_vllm_config(model_name: str, gpu_type: str, model_config: dict = None, i
         config["quantization"] = "bitsandbytes"
     elif "gguf" in model_lower:
         config["quantization"] = None
+        # GGUF specific optimizations
+        config["max_model_len"] = min(config["max_model_len"], 4096)  # Conservative for GGUF
+        config["max_num_seqs"] = min(config["max_num_seqs"], 4)  # Conservative for MoE
+        print("� Applied GGUF model optimizations")
     
     # Sharded models need more conservative memory settings
     if is_sharded:
-        print("🔗 Detected sharded model - applying conservative memory settings")
+        print("�🔗 Detected sharded model - applying conservative memory settings")
         config["max_num_seqs"] = max(1, config["max_num_seqs"] // 3)  # More aggressive reduction
         config["max_model_len"] = int(config["max_model_len"] * 0.7)  # Reduce context length for memory
     
@@ -509,7 +556,7 @@ base_image = (
         "packaging",
         "wheel",
     )
-    .pip_install("vllm==0.9.1")
+    .pip_install("vllm==0.10.0")
     .pip_install(
         "accelerate",
         "openai", 
@@ -623,12 +670,21 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
         vllm_config["max_num_seqs"] * min(512, vllm_config["max_model_len"])  # Conservative batch size
     )
     
-    # Build vLLM command with FIXED parameters
+    # Build vLLM command with FIXED parameters and GGUF support
+    if is_gguf_model(model_name):
+        # For GGUF models, use the specific .gguf file path
+        gguf_file_path = get_gguf_file_path(model_path)
+        model_arg = str(gguf_file_path)
+        print(f"🔧 Using GGUF file: {gguf_file_path.name}")
+    else:
+        # For other models, use the directory path
+        model_arg = str(model_path)
+    
     vllm_command = [
         "python", "-m", "vllm.entrypoints.openai.api_server",
         "--host", "0.0.0.0", 
         "--port", str(port),
-        "--model", str(model_path),
+        "--model", model_arg,
         "--served-model-name", model_name,
         "--tensor-parallel-size", str(vllm_config["tensor_parallel_size"]),
         "--max-model-len", str(vllm_config["max_model_len"]),
@@ -1298,6 +1354,22 @@ def test_bnb_quantization():
         "Hello! Testing BitsAndBytes 4-bit quantization.",
         "What are the benefits of model quantization?",
         "Thank you for demonstrating quantization!"
+    ], api_only=False)
+
+@app.local_entrypoint()
+def test_gguf_model():
+    """Test GGUF MoE model"""
+    model_name = "DavidAU/Llama-3.2-8X3B-MOE-Dark-Champion-Instruct-uncensored-abliterated-18.4B-GGUF"
+    print(f"🧪 Testing GGUF MoE model: {model_name}")
+    print(f"🔧 This will automatically select H100 for 18.4B MoE GGUF")
+    print(f"🗜️ GGUF format with built-in quantization")
+    print(f"💬 Chat template will be automatically configured")
+    
+    chat_func = get_chat_function(model_name)
+    chat_func.remote(model_name, [
+        "Hello! Testing GGUF format support with MoE model.",
+        "What is a Mixture of Experts model and how does it work?",
+        "Thank you for demonstrating GGUF format!"
     ], api_only=False)
 
 @app.local_entrypoint()
