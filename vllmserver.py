@@ -9,7 +9,7 @@ import json
 import modal
 
 # --- Configuration ---
-DEFAULT_MODEL = "microsoft/DialoGPT-medium"
+DEFAULT_MODEL = "DavidAU/Llama-3.2-8X3B-MOE-Dark-Champion-Instruct-uncensored-abliterated-18.4B-GGUF"
 
 # --- Modal App Setup ---
 app = modal.App("vllm-openai-server")
@@ -265,31 +265,41 @@ def download_model_to_path(model_name: str, model_path: Path):
     if model_path.exists():
         print(f"📁 Model directory exists at {model_path}, checking integrity...")
         
-        # Check for essential files
-        essential_files = ["config.json"]
-        missing_essential = []
-        for file in essential_files:
-            file_path = model_path / file
-            if not file_path.exists() or file_path.stat().st_size == 0:
-                missing_essential.append(file)
-        
-        if missing_essential:
-            print(f"❌ Found missing essential files: {missing_essential}")
-            print(f"❌ Re-downloading...")
-            print("🗑️  Removing corrupted model directory...")
-            shutil.rmtree(model_path)
-        else:
-            # Check model weights integrity
-            is_sharded, shard_count, shard_files = check_model_sharding(model_path)
-            
-            if shard_count == 0:
-                print(f"❌ No model weights found, re-downloading...")
+        # For GGUF models, check for GGUF file instead of config.json
+        if is_gguf_model(model_name):
+            gguf_files = list(model_path.glob("*.gguf"))
+            if len(gguf_files) == 0:
+                print(f"❌ No GGUF files found, re-downloading...")
                 shutil.rmtree(model_path)
             else:
-                print("✅ Model integrity check passed - using cached model")
-                if is_sharded:
-                    print(f"🔗 Sharded model with {shard_count} shards detected")
+                print("✅ GGUF model integrity check passed - using cached model")
                 return
+        else:
+            # Check for essential files for non-GGUF models
+            essential_files = ["config.json"]
+            missing_essential = []
+            for file in essential_files:
+                file_path = model_path / file
+                if not file_path.exists() or file_path.stat().st_size == 0:
+                    missing_essential.append(file)
+            
+            if missing_essential:
+                print(f"❌ Found missing essential files: {missing_essential}")
+                print(f"❌ Re-downloading...")
+                print("🗑️  Removing corrupted model directory...")
+                shutil.rmtree(model_path)
+            else:
+                # Check model weights integrity
+                is_sharded, shard_count, shard_files = check_model_sharding(model_path)
+                
+                if shard_count == 0:
+                    print(f"❌ No model weights found, re-downloading...")
+                    shutil.rmtree(model_path)
+                else:
+                    print("✅ Model integrity check passed - using cached model")
+                    if is_sharded:
+                        print(f"🔗 Sharded model with {shard_count} shards detected")
+                    return
 
     if not model_path.exists():
         print(f"📥 Downloading {model_name} to {model_path}...")
@@ -311,12 +321,53 @@ def download_model_to_path(model_name: str, model_path: Path):
                         "*.txt",           # README, etc.
                         "*.md",            # Documentation
                         "tokenizer*",      # Tokenizer files
+                        "*.model",         # SentencePiece model files
+                        "*.vocab",         # Vocabulary files
+                        "special_tokens_map.json",  # Special tokens
+                        "tokenizer_config.json",    # Tokenizer config
+                        "vocab.json",               # Vocab JSON
+                        "merges.txt",              # BPE merges
                     ],
                     token=os.environ.get("HF_TOKEN"),
                     resume_download=True,
                     local_files_only=False,
                 )
                 print(f"🎯 Selective GGUF download completed - only high-quality quantizations downloaded")
+                
+                # Check if we have tokenizer files, if not, try to get them from base model
+                tokenizer_files = list(model_path.glob("tokenizer*")) + list(model_path.glob("*.model"))
+                if len(tokenizer_files) == 0:
+                    print(f"⚠️ No tokenizer files found in GGUF repo, trying to get from base model...")
+                    # Try to extract base model name and download tokenizer from there
+                    base_model_candidates = [
+                        "meta-llama/Llama-3.2-3B-Instruct",  # Common base for Llama 3.2
+                        "meta-llama/Meta-Llama-3-8B-Instruct",  # Fallback
+                    ]
+                    
+                    for base_model in base_model_candidates:
+                        try:
+                            print(f"🔄 Trying to get tokenizer from {base_model}...")
+                            snapshot_download(
+                                repo_id=base_model,
+                                local_dir=model_path,
+                                allow_patterns=[
+                                    "tokenizer*",
+                                    "*.model",
+                                    "*.vocab",
+                                    "special_tokens_map.json",
+                                    "tokenizer_config.json",
+                                    "vocab.json",
+                                    "merges.txt",
+                                ],
+                                token=os.environ.get("HF_TOKEN"),
+                                resume_download=True,
+                                local_files_only=False,
+                            )
+                            print(f"✅ Tokenizer files downloaded from {base_model}")
+                            break
+                        except Exception as e:
+                            print(f"⚠️ Failed to get tokenizer from {base_model}: {e}")
+                            continue
             else:
                 # Standard download for non-GGUF models
                 snapshot_download(
@@ -330,11 +381,17 @@ def download_model_to_path(model_name: str, model_path: Path):
             print("✅ Download complete!")
             
             # Check what we downloaded
-            is_sharded, shard_count, shard_files = check_model_sharding(model_path)
-            if is_sharded:
-                print(f"🔗 Downloaded sharded model with {shard_count} parts")
+            if is_gguf_model(model_name):
+                gguf_files = list(model_path.glob("*.gguf"))
+                print(f"📊 Found {len(gguf_files)} GGUF files")
+                tokenizer_files = list(model_path.glob("tokenizer*")) + list(model_path.glob("*.model"))
+                print(f"🔤 Found {len(tokenizer_files)} tokenizer files")
             else:
-                print("📦 Downloaded single-file model")
+                is_sharded, shard_count, shard_files = check_model_sharding(model_path)
+                if is_sharded:
+                    print(f"🔗 Downloaded sharded model with {shard_count} parts")
+                else:
+                    print("📦 Downloaded single-file model")
             
             print("💾 Model saved to persistent volume!")
             
@@ -716,13 +773,17 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
     
     # Build vLLM command with FIXED parameters and GGUF support
     if is_gguf_model(model_name):
-        # For GGUF models, use the specific .gguf file path
+        # For GGUF models, use the specific .gguf file path as string
         gguf_file_path = get_gguf_file_path(model_path)
         model_arg = str(gguf_file_path)
+        # CRITICAL: For GGUF, tokenizer should use the model directory, not the file
+        tokenizer_arg = str(model_path)
         print(f"🔧 Using GGUF file: {gguf_file_path.name}")
+        print(f"🔧 Using tokenizer path: {model_path}")
     else:
         # For other models, use the directory path
         model_arg = str(model_path)
+        tokenizer_arg = str(model_path)
     
     vllm_command = [
         "python", "-m", "vllm.entrypoints.openai.api_server",
@@ -739,6 +800,11 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
         "--dtype", vllm_config["dtype"],
         "--max-num-seqs", str(vllm_config["max_num_seqs"]),  # Explicitly set max sequences
     ]
+    
+    # CRITICAL: For GGUF models, add separate tokenizer path
+    if is_gguf_model(model_name):
+        vllm_command.extend(["--tokenizer", tokenizer_arg])
+        print(f"🔧 Added separate tokenizer path for GGUF: {tokenizer_arg}")
     
     # FIXED: Only add FP8 KV cache for non-quantized models
     if model_size_gb > 30 and gpu_type in ["H100", "H200", "B200"] and not vllm_config["quantization"]:
@@ -1207,8 +1273,9 @@ def download_model_remote(model_name: str):
     image=base_image,
     volumes={"/models": default_volume}
 )
-def list_model_files(model_name: str):
-    """List files in a model's volume"""
+def list_model_files():
+    """List files in the default GGUF model's volume"""
+    model_name = DEFAULT_MODEL
     model_path = get_model_path_from_name(model_name)
     
     if not model_path.exists():
@@ -1273,6 +1340,80 @@ def delete_model_from_volume(model_name: str):
     shutil.rmtree(model_path)
     
     return f"✅ Model {model_name} deleted from volume"
+
+@app.function(
+    image=base_image,
+    volumes={"/models": default_volume}
+)
+def cleanup_gguf_model(model_name: str):
+    """Clean up GGUF model - keep only Q8_0 and essential files"""
+    model_path = get_model_path_from_name(model_name)
+    
+    if not model_path.exists():
+        return f"❌ Model {model_name} not found in volume"
+    
+    if not is_gguf_model(model_name):
+        return f"❌ Model {model_name} is not a GGUF model"
+    
+    print(f"🧹 Cleaning up GGUF model: {model_name}")
+    
+    # Get all files
+    all_files = list(model_path.glob("*"))
+    total_size_before = sum(f.stat().st_size for f in all_files if f.is_file())
+    
+    # Find the best GGUF file (Q8_0)
+    try:
+        best_gguf = get_gguf_file_path(model_path)
+        print(f"🎯 Keeping best GGUF file: {best_gguf.name}")
+    except Exception as e:
+        return f"❌ Could not find GGUF file: {e}"
+    
+    # Files to keep
+    keep_patterns = [
+        "*.json",          # Config files
+        "*.txt",           # README, etc.
+        "*.md",            # Documentation
+        "tokenizer*",      # Tokenizer files
+        best_gguf.name,    # The selected GGUF file
+    ]
+    
+    files_to_keep = set()
+    for pattern in keep_patterns:
+        files_to_keep.update(model_path.glob(pattern))
+    
+    # Delete unwanted GGUF files
+    deleted_files = []
+    deleted_size = 0
+    
+    for file in all_files:
+        if file.is_file() and file not in files_to_keep:
+            if file.name.endswith('.gguf'):
+                size_gb = file.stat().st_size / 1e9
+                print(f"🗑️ Deleting: {file.name} ({size_gb:.1f} GB)")
+                deleted_size += file.stat().st_size
+                deleted_files.append(file.name)
+                file.unlink()
+    
+    # Calculate savings
+    total_size_after = sum(f.stat().st_size for f in model_path.glob("*") if f.is_file())
+    saved_gb = (total_size_before - total_size_after) / 1e9
+    
+    result = [
+        f"✅ GGUF cleanup completed for {model_name}",
+        f"🎯 Kept: {best_gguf.name}",
+        f"🗑️ Deleted {len(deleted_files)} files:",
+    ]
+    
+    for file in deleted_files:
+        result.append(f"   - {file}")
+    
+    result.extend([
+        f"💾 Size before: {total_size_before / 1e9:.2f} GB",
+        f"💾 Size after: {total_size_after / 1e9:.2f} GB", 
+        f"💰 Saved: {saved_gb:.2f} GB ({saved_gb/total_size_before*100:.1f}%)"
+    ])
+    
+    return "\n".join(result)
 
 # --- Local entrypoints ---
 @app.local_entrypoint()
@@ -1403,7 +1544,7 @@ def test_bnb_quantization():
 @app.local_entrypoint()
 def test_gguf_model():
     """Test GGUF MoE model"""
-    model_name = "DavidAU/Llama-3.2-8X3B-MOE-Dark-Champion-Instruct-uncensored-abliterated-18.4B-GGUF"
+    model_name = DEFAULT_MODEL
     print(f"🧪 Testing GGUF MoE model: {model_name}")
     print(f"🔧 This will automatically select H100 for 18.4B MoE GGUF")
     print(f"🗜️ GGUF format with built-in quantization")
@@ -1415,6 +1556,38 @@ def test_gguf_model():
         "What is a Mixture of Experts model and how does it work?",
         "Thank you for demonstrating GGUF format!"
     ], api_only=False)
+
+@app.local_entrypoint()
+def cleanup_gguf():
+    """Clean up GGUF model - remove unwanted quantizations"""
+    model_name = DEFAULT_MODEL
+    print(f"🧹 Cleaning up GGUF model: {model_name}")
+    print(f"🎯 Will keep only Q8_0 (best quality) and essential files")
+    print(f"🗑️ Will delete other quantization levels to save space")
+    
+    result = cleanup_gguf_model.remote(model_name)
+    print(result)
+
+@app.local_entrypoint()
+def redownload_gguf():
+    """Re-download GGUF model with tokenizer files"""
+    model_name = DEFAULT_MODEL
+    print(f"🔄 Re-downloading GGUF model with tokenizer files: {model_name}")
+    print(f"🗑️ First deleting existing model...")
+    
+    # Delete existing model
+    delete_result = delete_model_from_volume.remote(model_name)
+    print(delete_result)
+    
+    print(f"📥 Now downloading with complete tokenizer support...")
+    # Re-download with tokenizer files
+    download_result = download_model_remote.remote(model_name)
+    print(download_result)
+    
+    print(f"📋 Listing downloaded files...")
+    # List files to verify
+    list_result = list_model_files.remote(model_name)
+    print(list_result)
 
 @app.local_entrypoint()
 def gpu_specs():
