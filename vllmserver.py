@@ -62,11 +62,33 @@ def is_gguf_model(model_name: str) -> bool:
     return "gguf" in model_name.lower()
 
 def get_gguf_file_path(model_path: Path) -> Path:
-    """Get the path to the GGUF file (must be exactly one)"""
+    """Get the best GGUF file (prefer Q8_0, then highest quality)"""
     gguf_files = list(model_path.glob("*.gguf"))
-    if len(gguf_files) != 1:
-        raise ValueError(f"Expected exactly 1 GGUF file, found {len(gguf_files)}: {[f.name for f in gguf_files]}")
-    return gguf_files[0]
+    
+    if len(gguf_files) == 0:
+        raise ValueError("No GGUF files found")
+    elif len(gguf_files) == 1:
+        print(f"🎯 Using single GGUF file: {gguf_files[0].name}")
+        return gguf_files[0]
+    else:
+        print(f"📊 Found {len(gguf_files)} GGUF files, selecting best quality...")
+        
+        # Priority order: Q8_0 (best) -> Q6_K -> Q5_K_M -> Q4_K_M -> others
+        priority_order = ["Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q3_K_S", "Q2_K"]
+        
+        for priority in priority_order:
+            for gguf_file in gguf_files:
+                if priority in gguf_file.name:
+                    size_gb = gguf_file.stat().st_size / 1e9
+                    print(f"🎯 Selected GGUF file: {gguf_file.name} ({size_gb:.1f} GB)")
+                    print(f"🗜️ Quantization level: {priority}")
+                    return gguf_file
+        
+        # Fallback to largest file (usually highest quality)
+        largest_file = max(gguf_files, key=lambda f: f.stat().st_size)
+        size_gb = largest_file.stat().st_size / 1e9
+        print(f"⚠️ Using fallback (largest) GGUF file: {largest_file.name} ({size_gb:.1f} GB)")
+        return largest_file
 
 def check_gguf_model(model_path: Path):
     """Check GGUF model and get info"""
@@ -274,14 +296,36 @@ def download_model_to_path(model_name: str, model_path: Path):
         model_path.mkdir(parents=True, exist_ok=True)
         
         try:
-            # Download to path
-            snapshot_download(
-                repo_id=model_name,
-                local_dir=model_path,
-                token=os.environ.get("HF_TOKEN"),
-                resume_download=True,  # Resume interrupted downloads
-                local_files_only=False,
-            )
+            # For GGUF models, use selective download to get only the best quality file
+            if is_gguf_model(model_name):
+                print(f"🎯 GGUF model detected - downloading selectively...")
+                # Download only Q8_0 (best quality) and essential files
+                snapshot_download(
+                    repo_id=model_name,
+                    local_dir=model_path,
+                    allow_patterns=[
+                        "*Q8_0.gguf",      # Best quality GGUF
+                        "*Q6_K.gguf",      # Fallback 1
+                        "*Q5_K_M.gguf",    # Fallback 2
+                        "*.json",          # Config files
+                        "*.txt",           # README, etc.
+                        "*.md",            # Documentation
+                        "tokenizer*",      # Tokenizer files
+                    ],
+                    token=os.environ.get("HF_TOKEN"),
+                    resume_download=True,
+                    local_files_only=False,
+                )
+                print(f"🎯 Selective GGUF download completed - only high-quality quantizations downloaded")
+            else:
+                # Standard download for non-GGUF models
+                snapshot_download(
+                    repo_id=model_name,
+                    local_dir=model_path,
+                    token=os.environ.get("HF_TOKEN"),
+                    resume_download=True,  # Resume interrupted downloads
+                    local_files_only=False,
+                )
             
             print("✅ Download complete!")
             
