@@ -1,20 +1,22 @@
-# GPU Yönetim Sistemi
+# GPU Yönetim Sistemi (llama-cpp)
 
 ## Genel Bakış
 
-GPU Yönetim Sistemi, model boyutu ve tipine göre otomatik olarak en uygun GPU'yu seçen ve memory kullanımını optimize eden sistemdir.
+GPU Yönetim Sistemi, GGUF model boyutu ve tipine göre otomatik olarak en uygun GPU'yu seçen ve llama-cpp için memory kullanımını optimize eden sistemdir. vLLM'den llama-cpp'ye geçiş ile birlikte daha agresif memory utilization ve MoE optimizasyonları eklendi.
 
 ## Ana Fonksiyonlar
 
-### `get_gpu_config(model_name: str) -> tuple[str, float]`
+### `get_gpu_config_llamacpp(model_name: str) -> tuple[str, float, str]`
 
-Model adından GPU tipini ve memory utilization değerini belirler.
+GGUF model adından GPU tipini, memory utilization değerini ve MoE optimizasyonlarını belirler.
 
 **Algoritma:**
-1. Model adından boyut tespiti (1B, 7B, 70B vb.)
-2. Quantization tespiti (GPTQ, AWQ, BnB, GGUF)
-3. GPU seçimi tablosuna göre mapping
-4. Memory utilization hesaplama
+1. GGUF model tespiti (zorunlu)
+2. Model adından boyut tespiti (1B, 7B, 70B vb.)
+3. MoE model tespiti (8x3B, 8x7B vb.)
+4. GPU seçimi tablosuna göre mapping
+5. llama-cpp için agresif memory utilization hesaplama
+6. MoE optimizasyon parametreleri
 
 **Desteklenen GPU Tipleri:**
 - T4 (16GB) - Küçük modeller
@@ -37,28 +39,29 @@ elif any(size in model_lower for size in ["13b", "14b", "17b", "27b", "34b"]):
     # Large model logic
 ```
 
-### Quantization Tespiti
+### GGUF Model Seçimi (Zorunlu)
 ```python
-if "gptq" in model_lower:
-    quantization = "gptq"
-elif "awq" in model_lower:
-    quantization = "awq"
-elif "gguf" in model_lower:
-    quantization = "gguf"
+if not is_gguf_model(model_name):
+    raise ValueError("Only GGUF models are supported in llama-cpp mode")
+
+# MoE model detection
+if "moe" in model_lower or "8x3b" in model_lower:
+    if "18b" in model_lower or "18.4b" in model_lower:
+        return "H100", 0.95, "--n-cpu-moe 80"  # 18.4B MoE GGUF
 ```
 
-### Memory Utilization Hesaplama
+### Memory Utilization Hesaplama (llama-cpp Optimized)
 
 **Faktörler:**
-- Model boyutu
-- Quantization durumu
+- GGUF built-in quantization
+- llama-cpp efficient memory management
+- MoE expert routing
 - GPU memory kapasitesi
-- Sharding durumu
 
-**Konservatif Yaklaşım:**
-- Büyük modeller için düşük utilization (0.60-0.75)
-- Sharded modeller için ekstra düşük (0.55)
-- OOM hatalarını önlemek için safety margin
+**Agresif Yaklaşım (llama-cpp):**
+- GGUF modeller için yüksek utilization (0.85-0.95)
+- MoE modeller için CPU offload ile hibrit yaklaşım
+- Daha az memory overhead
 
 ## Modal Fonksiyon Mapping
 
@@ -109,17 +112,29 @@ function_map = {
 
 ## Performance Optimizasyonları
 
-### Memory Optimizasyonları
-- FP8 KV cache (H100+ için)
-- Chunked prefill
-- Prefix caching
-- Block size optimization
+### llama-cpp Memory Optimizasyonları
+- GGUF memory mapping (use_mmap=True)
+- CUDA FP16 acceleration
+- GPU layer offloading (n_gpu_layers=-1)
+- MoE CPU offloading (--n-cpu-moe)
 
-### Environment Variables
+### Environment Variables (llama-cpp)
 ```python
-env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
-env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
-env["VLLM_USE_TRITON_FLASH_ATTN"] = "1"  # H100+ için
+env["CUDA_VISIBLE_DEVICES"] = "0"
+env["GGML_CUDA_ENABLE"] = "1"
+env["GGML_CUDA_F16"] = "1"  # FP16 for better performance
+```
+
+### llama-cpp Server Configuration
+```python
+config = {
+    "n_ctx": 2048,           # Context length
+    "n_batch": 512,          # Batch size
+    "n_gpu_layers": -1,      # All layers to GPU
+    "use_mmap": True,        # Memory mapping
+    "use_mlock": False,      # Memory locking (False for Modal)
+    "chat_format": "chatml", # RP-friendly format
+}
 ```
 
 ## İzleme ve Debugging

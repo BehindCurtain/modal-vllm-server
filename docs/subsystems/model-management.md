@@ -1,8 +1,8 @@
-# Model Yönetim Sistemi
+# Model Yönetim Sistemi (llama-cpp)
 
 ## Genel Bakış
 
-Model Yönetim Sistemi, model indirme, önbellekleme, format tespiti ve konfigürasyon işlemlerini yöneten sistemdir.
+Model Yönetim Sistemi, GGUF model indirme, önbellekleme, quantization seçimi ve konfigürasyon işlemlerini yöneten sistemdir. vLLM'den llama-cpp'ye geçiş ile birlikte GGUF formatına özelleşmiştir.
 
 ## Ana Fonksiyonlar
 
@@ -39,23 +39,17 @@ Model konfigürasyon dosyasını okur ve anahtar parametreleri çıkarır.
 
 ## Model Format Desteği
 
-### SafeTensors Format
-- **Dosyalar**: `model.safetensors` veya `model-*.safetensors`
-- **Index**: `model.safetensors.index.json`
-- **Avantajlar**: Güvenli, hızlı yükleme
-- **Durum**: Tam destek
-
-### PyTorch Format
-- **Dosyalar**: `pytorch_model.bin` veya `pytorch_model-*.bin`
-- **Index**: `pytorch_model.bin.index.json`
-- **Avantajlar**: Yaygın kullanım
-- **Durum**: Tam destek
-
-### GGUF Format (Yeni)
+### GGUF Format (Ana Format)
 - **Dosyalar**: `*.gguf` (tek dosya)
-- **Avantajlar**: Quantized, küçük boyut
-- **Gereksinimler**: vLLM 0.10.0+
-- **Durum**: Ekleniyor
+- **Avantajlar**: Built-in quantization, küçük boyut, hızlı yükleme
+- **Gereksinimler**: llama-cpp-python v0.2.24+
+- **Durum**: ✅ Tam destek
+- **Quantization Seviyeleri**: Q8_0 (öncelikli), Q6_K, Q5_K_M, Q4_K_M
+
+### Desteklenmeyen Formatlar
+- **SafeTensors**: ❌ llama-cpp modunda desteklenmiyor
+- **PyTorch**: ❌ llama-cpp modunda desteklenmiyor
+- **GPTQ/AWQ**: ❌ GGUF built-in quantization kullanılır
 
 ## Sharding Detection
 
@@ -143,31 +137,50 @@ Model'in vLLM ile uyumluluğunu kontrol eder.
 3. Error handling
 4. Graceful shutdown
 
-## GGUF Desteği (Yeni Özellik)
+## GGUF Quantization Seçimi
 
 ### Format Özellikleri
 - Tek dosyalı yapı
 - Built-in quantization
 - Metadata embedded
 - Fast loading
+- MoE model desteği
 
-### vLLM Integration
-- vLLM 0.10.0+ gerekli
+### llama-cpp Integration
+- llama-cpp-python v0.2.24+ gerekli
+- CUDA 11.8 ile optimize edilmiş
 - Özel parameter set
 - Memory optimization
 - Performance tuning
 
-### Detection Logic
+### Quantization Seçim Algoritması
 ```python
-def is_gguf_model(model_name: str) -> bool:
-    return "gguf" in model_name.lower()
-
-def get_gguf_file(model_path: Path) -> Path:
+def get_gguf_file_path(model_path: Path) -> Path:
+    """Get the best GGUF file (prefer Q8_0, then highest quality)"""
     gguf_files = list(model_path.glob("*.gguf"))
-    if len(gguf_files) == 1:
-        return gguf_files[0]
-    else:
-        raise ValueError("GGUF model must have exactly one .gguf file")
+    
+    # Priority order: Q8_0 (best) -> Q6_K -> Q5_K_M -> Q4_K_M -> others
+    priority_order = ["Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S"]
+    
+    for priority in priority_order:
+        for gguf_file in gguf_files:
+            if priority in gguf_file.name:
+                return gguf_file
+    
+    # Fallback to largest file (usually highest quality)
+    return max(gguf_files, key=lambda f: f.stat().st_size)
+```
+
+### Seçici İndirme Sistemi
+```python
+# Sadece yüksek kaliteli quantization'ları indir
+allow_patterns=[
+    "*Q8_0.gguf",      # Best quality GGUF
+    "*Q6_K.gguf",      # Fallback 1
+    "*Q5_K_M.gguf",    # Fallback 2
+    "tokenizer*",      # Tokenizer files
+    "*.json",          # Config files
+]
 ```
 
 ## Error Handling

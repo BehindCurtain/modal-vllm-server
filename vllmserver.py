@@ -12,10 +12,10 @@ import modal
 DEFAULT_MODEL = "DavidAU/Llama-3.2-8X3B-MOE-Dark-Champion-Instruct-uncensored-abliterated-18.4B-GGUF"
 
 # --- Modal App Setup ---
-app = modal.App("vllm-openai-server")
+app = modal.App("llamacpp-openai-server")
 
 # --- Create a default volume for the app ---
-default_volume = modal.Volume.from_name("vllm-models-storage", create_if_missing=True)
+default_volume = modal.Volume.from_name("llamacpp-models-storage", create_if_missing=True)
 
 # --- Helper functions ---
 def get_model_path_from_name(model_name: str):
@@ -90,171 +90,8 @@ def get_gguf_file_path(model_path: Path) -> Path:
         print(f"⚠️ Using fallback (largest) GGUF file: {largest_file.name} ({size_gb:.1f} GB)")
         return largest_file
 
-def check_gguf_model(model_path: Path):
-    """Check GGUF model and get info"""
-    try:
-        gguf_file = get_gguf_file_path(model_path)
-        size_gb = gguf_file.stat().st_size / 1e9
-        print(f"📊 Found GGUF model file: {gguf_file.name} ({size_gb:.2f} GB)")
-        return True, 1, [gguf_file.name], size_gb
-    except Exception as e:
-        print(f"❌ GGUF model check failed: {e}")
-        return False, 0, [], 0
-
-def setup_chat_template(model_path: Path, model_name: str):
-    """Set up chat template for models that don't have one"""
-    tokenizer_config_path = model_path / "tokenizer_config.json"
-    
-    if not tokenizer_config_path.exists():
-        print("⚠️ No tokenizer config found")
-        return
-    
-    try:
-        with open(tokenizer_config_path, 'r') as f:
-            config = json.load(f)
-        
-        # Check if chat template exists
-        if config.get("chat_template"):
-            print("✅ Chat template already exists")
-            return
-        
-        print("🔧 Adding missing chat template...")
-        
-        # Default chat template for Yi models
-        if "yi" in model_name.lower():
-            config["chat_template"] = "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}<|im_start|>assistant\n"
-        # Template for Qwen models
-        elif "qwen" in model_name.lower():
-            config["chat_template"] = "{% for message in messages %}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{% endfor %}<|im_start|>assistant\n"
-        # Template for Mistral models
-        elif "mistral" in model_name.lower():
-            config["chat_template"] = "{% for message in messages %}{% if message['role'] == 'user' %}[INST] {{ message['content'] }} [/INST]{% elif message['role'] == 'assistant' %}{{ message['content'] }}{% endif %}{% endfor %}"
-        # Template for DialoGPT
-        elif "dialo" in model_name.lower():
-            config["chat_template"] = "{% for message in messages %}{% if message['role'] == 'user' %}{{ message['content'] }}{% elif message['role'] == 'assistant' %}{{ message['content'] }}{% endif %}{% if not loop.last %}{% endif %}{% endfor %}"
-        # Generic template for other models
-        else:
-            config["chat_template"] = "{% for message in messages %}{% if message['role'] == 'user' %}### Human: {{ message['content'] }}\n{% elif message['role'] == 'assistant' %}### Assistant: {{ message['content'] }}\n{% endif %}{% endfor %}### Assistant: "
-        
-        # Save updated config
-        with open(tokenizer_config_path, 'w') as f:
-            json.dump(config, f, indent=2)
-        
-        print("✅ Chat template added successfully")
-        
-    except Exception as e:
-        print(f"⚠️ Could not update chat template: {e}")
-
-def is_model_supported(model_config: dict, model_name: str) -> bool:
-    """Check if the model is likely supported by vLLM"""
-    if not model_config:
-        return True  # Assume supported if we can't read config
-    
-    model_type = model_config.get("model_type", "").lower()
-    architectures = [arch.lower() for arch in model_config.get("architectures", [])]
-    
-    # Known problematic model types for vLLM 0.9.1
-    problematic_types = ["stablelm", "stablelmepoch"]
-    problematic_architectures = ["stablelmlayer", "stablelm"]
-    
-    if model_type in problematic_types:
-        print(f"⚠️ Model type '{model_type}' may have compatibility issues with vLLM 0.9.1")
-        return False
-    
-    if any(arch in problematic_architectures for arch in architectures):
-        print(f"⚠️ Architecture {architectures} may have compatibility issues with vLLM 0.9.1")
-        return False
-    
-    return True
-
-def check_model_sharding(model_path: Path):
-    """Check if model is sharded and get shard info"""
-    index_path = model_path / "pytorch_model.bin.index.json"
-    safetensors_index_path = model_path / "model.safetensors.index.json"
-    
-    # Check for sharded PyTorch models
-    if index_path.exists():
-        try:
-            with open(index_path, 'r') as f:
-                index_data = json.load(f)
-            weight_map = index_data.get("weight_map", {})
-            shard_files = set(weight_map.values())
-            print(f"📊 Found PyTorch sharded model with {len(shard_files)} shards:")
-            for i, shard in enumerate(sorted(shard_files)[:5], 1):  # Show first 5
-                shard_path = model_path / shard
-                if shard_path.exists():
-                    size_mb = shard_path.stat().st_size / 1e6
-                    print(f"   ✅ {shard} ({size_mb:.1f} MB)")
-                else:
-                    print(f"   ❌ {shard} (missing)")
-            if len(shard_files) > 5:
-                print(f"   ... and {len(shard_files) - 5} more shards")
-            return True, len(shard_files), list(shard_files)
-        except Exception as e:
-            print(f"⚠️ Could not read PyTorch shard index: {e}")
-    
-    # Check for sharded SafeTensors models
-    elif safetensors_index_path.exists():
-        try:
-            with open(safetensors_index_path, 'r') as f:
-                index_data = json.load(f)
-            weight_map = index_data.get("weight_map", {})
-            shard_files = set(weight_map.values())
-            print(f"📊 Found SafeTensors sharded model with {len(shard_files)} shards:")
-            for i, shard in enumerate(sorted(shard_files)[:5], 1):  # Show first 5
-                shard_path = model_path / shard
-                if shard_path.exists():
-                    size_mb = shard_path.stat().st_size / 1e6
-                    print(f"   ✅ {shard} ({size_mb:.1f} MB)")
-                else:
-                    print(f"   ❌ {shard} (missing)")
-            if len(shard_files) > 5:
-                print(f"   ... and {len(shard_files) - 5} more shards")
-            return True, len(shard_files), list(shard_files)
-        except Exception as e:
-            print(f"⚠️ Could not read SafeTensors shard index: {e}")
-    
-    # Check for simple sharded files (no index)
-    pytorch_shards = list(model_path.glob("pytorch_model-*.bin"))
-    safetensors_shards = list(model_path.glob("model-*.safetensors"))
-    
-    if pytorch_shards:
-        print(f"📊 Found {len(pytorch_shards)} PyTorch shard files (no index):")
-        for shard in sorted(pytorch_shards)[:5]:
-            size_mb = shard.stat().st_size / 1e6
-            print(f"   ✅ {shard.name} ({size_mb:.1f} MB)")
-        if len(pytorch_shards) > 5:
-            print(f"   ... and {len(pytorch_shards) - 5} more shards")
-        return True, len(pytorch_shards), [s.name for s in pytorch_shards]
-    
-    elif safetensors_shards:
-        print(f"📊 Found {len(safetensors_shards)} SafeTensors shard files (no index):")
-        for shard in sorted(safetensors_shards)[:5]:
-            size_mb = shard.stat().st_size / 1e6
-            print(f"   ✅ {shard.name} ({size_mb:.1f} MB)")
-        if len(safetensors_shards) > 5:
-            print(f"   ... and {len(safetensors_shards) - 5} more shards")
-        return True, len(safetensors_shards), [s.name for s in safetensors_shards]
-    
-    else:
-        # Check for single model files
-        pytorch_single = model_path / "pytorch_model.bin"
-        safetensors_single = model_path / "model.safetensors"
-        
-        if pytorch_single.exists():
-            size_mb = pytorch_single.stat().st_size / 1e6
-            print(f"📊 Found single PyTorch model file: pytorch_model.bin ({size_mb:.1f} MB)")
-            return False, 1, ["pytorch_model.bin"]
-        elif safetensors_single.exists():
-            size_mb = safetensors_single.stat().st_size / 1e6
-            print(f"📊 Found single SafeTensors model file: model.safetensors ({size_mb:.1f} MB)")
-            return False, 1, ["model.safetensors"]
-        else:
-            print("❌ No model weights found!")
-            return False, 0, []
-
 def download_model_to_path(model_name: str, model_path: Path):
-    """Download model to specific path with integrity checking for sharded models"""
+    """Download model to specific path with GGUF optimization"""
     import os
     import shutil
     from huggingface_hub import snapshot_download
@@ -265,7 +102,7 @@ def download_model_to_path(model_name: str, model_path: Path):
     if model_path.exists():
         print(f"📁 Model directory exists at {model_path}, checking integrity...")
         
-        # For GGUF models, check for GGUF file instead of config.json
+        # For GGUF models, check for GGUF file
         if is_gguf_model(model_name):
             gguf_files = list(model_path.glob("*.gguf"))
             if len(gguf_files) == 0:
@@ -275,31 +112,8 @@ def download_model_to_path(model_name: str, model_path: Path):
                 print("✅ GGUF model integrity check passed - using cached model")
                 return
         else:
-            # Check for essential files for non-GGUF models
-            essential_files = ["config.json"]
-            missing_essential = []
-            for file in essential_files:
-                file_path = model_path / file
-                if not file_path.exists() or file_path.stat().st_size == 0:
-                    missing_essential.append(file)
-            
-            if missing_essential:
-                print(f"❌ Found missing essential files: {missing_essential}")
-                print(f"❌ Re-downloading...")
-                print("🗑️  Removing corrupted model directory...")
-                shutil.rmtree(model_path)
-            else:
-                # Check model weights integrity
-                is_sharded, shard_count, shard_files = check_model_sharding(model_path)
-                
-                if shard_count == 0:
-                    print(f"❌ No model weights found, re-downloading...")
-                    shutil.rmtree(model_path)
-                else:
-                    print("✅ Model integrity check passed - using cached model")
-                    if is_sharded:
-                        print(f"🔗 Sharded model with {shard_count} shards detected")
-                    return
+            print("❌ Non-GGUF models not supported in llama-cpp mode")
+            return
 
     if not model_path.exists():
         print(f"📥 Downloading {model_name} to {model_path}...")
@@ -369,29 +183,16 @@ def download_model_to_path(model_name: str, model_path: Path):
                             print(f"⚠️ Failed to get tokenizer from {base_model}: {e}")
                             continue
             else:
-                # Standard download for non-GGUF models
-                snapshot_download(
-                    repo_id=model_name,
-                    local_dir=model_path,
-                    token=os.environ.get("HF_TOKEN"),
-                    resume_download=True,  # Resume interrupted downloads
-                    local_files_only=False,
-                )
+                print("❌ Only GGUF models are supported in llama-cpp mode")
+                return
             
             print("✅ Download complete!")
             
             # Check what we downloaded
-            if is_gguf_model(model_name):
-                gguf_files = list(model_path.glob("*.gguf"))
-                print(f"📊 Found {len(gguf_files)} GGUF files")
-                tokenizer_files = list(model_path.glob("tokenizer*")) + list(model_path.glob("*.model"))
-                print(f"🔤 Found {len(tokenizer_files)} tokenizer files")
-            else:
-                is_sharded, shard_count, shard_files = check_model_sharding(model_path)
-                if is_sharded:
-                    print(f"🔗 Downloaded sharded model with {shard_count} parts")
-                else:
-                    print("📦 Downloaded single-file model")
+            gguf_files = list(model_path.glob("*.gguf"))
+            print(f"📊 Found {len(gguf_files)} GGUF files")
+            tokenizer_files = list(model_path.glob("tokenizer*")) + list(model_path.glob("*.model"))
+            print(f"🔤 Found {len(tokenizer_files)} tokenizer files")
             
             print("💾 Model saved to persistent volume!")
             
@@ -403,291 +204,122 @@ def download_model_to_path(model_name: str, model_path: Path):
     else:
         print(f"✅ Model already exists at {model_path}")
 
-# --- Dynamic GPU selection based on model ---
-def get_gpu_config(model_name: str):
-    """Get appropriate GPU configuration based on model size"""
+# --- GPU selection based on model (adapted for llama-cpp) ---
+def get_gpu_config_llamacpp(model_name: str):
+    """Get appropriate GPU configuration for llama-cpp"""
     model_name_lower = model_name.lower()
     
-    # GGUF MoE models (special handling)
+    # GGUF MoE models (special handling - no special MoE flags needed)
     if is_gguf_model(model_name):
         if "moe" in model_name_lower or "8x3b" in model_name_lower:
             if "18b" in model_name_lower or "18.4b" in model_name_lower:
-                return "H100", 0.75  # 18.4B MoE GGUF needs H100
+                return "H100", 0.95  # 18.4B MoE GGUF needs H100
             elif "14b" in model_name_lower:
-                return "H100", 0.80  # 14B MoE GGUF
+                return "H100", 0.90  # 14B MoE GGUF
             elif "7b" in model_name_lower or "8b" in model_name_lower:
-                return "L40S", 0.75  # 7-8B MoE GGUF
+                return "L40S", 0.85  # 7-8B MoE GGUF
         # Regular GGUF models
         elif "34b" in model_name_lower:
-            return "H200", 0.70  # 34B GGUF
+            return "H200", 0.85  # 34B GGUF
         elif "13b" in model_name_lower or "14b" in model_name_lower:
-            return "A100-80GB", 0.75  # 13-14B GGUF
+            return "A100-80GB", 0.90  # 13-14B GGUF
         elif "7b" in model_name_lower or "8b" in model_name_lower:
-            return "L40S", 0.75  # 7-8B GGUF
+            return "L40S", 0.85  # 7-8B GGUF
         elif "3b" in model_name_lower:
-            return "A10G", 0.75  # 3B GGUF
+            return "A10G", 0.85  # 3B GGUF
         else:
-            return "L4", 0.75  # Small GGUF models
+            return "L4", 0.85  # Small GGUF models
     
-    # Massive models (70B+ parameters)
-    elif any(size in model_name_lower for size in ["70b", "72b", "405b"]):
-        if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq", "bnb"]):
-            if "405b" in model_name_lower:
-                return "B200", 0.90  # 405B quantized needs B200
-            elif any(size in model_name_lower for size in ["70b", "72b"]):
-                return "H200", 0.85  # 70B quantized can fit on H200
-        else:
-            # Full precision massive models
-            if "405b" in model_name_lower:
-                return "B200", 0.95  # 405B full precision needs B200
-            elif any(size in model_name_lower for size in ["70b", "72b"]):
-                return "H100", 0.80  # 70B full precision needs H100, not A100
-    
-    # Large models (13B-34B parameters) - FIXED MEMORY ALLOCATION
-    elif any(size in model_name_lower for size in ["13b", "14b", "17b", "27b", "34b"]):
-        if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq", "bnb"]):
-            if any(size in model_name_lower for size in ["34b"]):
-                return "H100", 0.80  # 34B quantized can fit on H100 
-            elif any(size in model_name_lower for size in ["27b"]):
-                return "A100-80GB", 0.75  # 27B quantized can fit on A100-80GB with reduced memory
-            elif any(size in model_name_lower for size in ["17b"]):
-                return "H100", 0.80  # 17B quantized fits on H100
-            elif any(size in model_name_lower for size in ["13b", "14b"]):
-                return "A100-40GB", 0.80  # 13B quantized fits on A100-40GB
-        else:
-            # Full precision large models - CRITICAL FIX
-            if any(size in model_name_lower for size in ["34b"]):
-                return "H200", 0.70  # 34B full precision REQUIRES H200 (141GB)
-            elif any(size in model_name_lower for size in ["27b"]):
-                return "H100", 0.80  # 27B full precision safer on H100
-            elif any(size in model_name_lower for size in ["17b"]):
-                return "H100", 0.85  # 17B full precision needs H100
-            elif any(size in model_name_lower for size in ["13b", "14b"]):
-                return "A100-40GB", 0.80  # 13B full precision needs A100-40GB
-    
-    # Medium-large models (7B-12B parameters)
-    elif any(size in model_name_lower for size in ["7b", "8b", "9b", "12b"]):
-        if any(quant in model_name_lower for quant in ["gptq", "int4", "int8", "awq", "bnb"]):
-            return "L40S", 0.75   # 7B-12B quantized fits on L40S
-        else:
-            # Full precision medium-large models
-            return "L40S", 0.80  # 7B-12B full precision works well on L40S
-    
-    # Medium models (3-6B parameters)  
-    elif any(size in model_name_lower for size in ["3b", "4b", "6b"]):
-        if "stablelm" in model_name_lower or "stablecode" in model_name_lower:
-            return "A10G", 0.8  # StableLM models need more resources
-        elif any(size in model_name_lower for size in ["6b"]):
-            return "A10G", 0.75  # 6B models work well on A10G
-        elif any(size in model_name_lower for size in ["3b", "4b"]):
-            return "L4", 0.75
-        else:
-            return "A10G", 0.8
-    
-    # Small models (1-2B parameters)
-    elif any(size in model_name_lower for size in ["1b", "2b", "mini", "small", "tinyllama"]):
-        return "T4", 0.8
-    
-    # Chat/dialog models (usually medium sized)
-    elif any(term in model_name_lower for term in ["dialog", "chat", "gpt2", "dialo"]):
-        return "L4", 0.75  # Most chat models are small-medium
-    
-    # Default for unknown sizes
-    else:
-        return "L4", 0.75  # Conservative default
+    # Default for non-GGUF (though not supported)
+    return "L4", 0.85
 
-# --- FIXED vLLM configuration with better memory management ---
-def get_vllm_config(model_name: str, gpu_type: str, model_config: dict = None, is_sharded: bool = False):
-    """Get vLLM configuration based on model and GPU with better memory management"""
+def get_llamacpp_config(model_name: str, gpu_type: str, gguf_file_path: Path):
+    """Get llama-cpp server configuration"""
     config = {
-        "max_model_len": 2048,
-        "max_num_seqs": 4,
-        "tensor_parallel_size": 1,
-        "dtype": "auto",
-        "quantization": None,
-        "trust_remote_code": True,
+        "n_ctx": 2048,
+        "n_batch": 512,
+        "n_gpu_layers": -1,  # All layers to GPU by default
+        "use_mmap": True,
+        "use_mlock": False,  # False for Modal environment
+        "chat_format": "chatml",  # RP-friendly default
+        "verbose": True,
+        "n_threads": 8
     }
     
     model_lower = model_name.lower()
     
-    # Use actual model config if available
-    if model_config:
-        max_pos_emb = model_config.get("max_position_embeddings")
-        model_max_len = model_config.get("model_max_length")
-        
-        if max_pos_emb:
-            config["max_model_len"] = int(max_pos_emb * 0.7)  # Reduced from 0.9 to 0.7 for safety
-        elif model_max_len:
-            config["max_model_len"] = min(model_max_len, 2048)
-        
-        print(f"🔧 Adjusted max_model_len to {config['max_model_len']} based on model config")
-    
-    # FIXED: Detect quantization correctly
-    if "gptq" in model_lower:
-        config["quantization"] = "gptq"
-    elif "awq" in model_lower:
-        config["quantization"] = "awq"
-    elif "bnb" in model_lower or "bitsandbytes" in model_lower:
-        config["quantization"] = "bitsandbytes"
-    elif "int4" in model_lower:
-        # Check if it's BnB or GPTQ based on model name
-        if "bnb" in model_lower or "bitsandbytes" in model_lower:
-            config["quantization"] = "bitsandbytes"
-        else:
-            config["quantization"] = "gptq"
-    elif "int8" in model_lower:
-        config["quantization"] = "bitsandbytes"
-    elif "gguf" in model_lower:
-        config["quantization"] = None
-        # GGUF specific optimizations
-        config["max_model_len"] = min(config["max_model_len"], 4096)  # Conservative for GGUF
-        config["max_num_seqs"] = min(config["max_num_seqs"], 4)  # Conservative for MoE
-        print("� Applied GGUF model optimizations")
-    
-    # Sharded models need more conservative memory settings
-    if is_sharded:
-        print("�🔗 Detected sharded model - applying conservative memory settings")
-        config["max_num_seqs"] = max(1, config["max_num_seqs"] // 3)  # More aggressive reduction
-        config["max_model_len"] = int(config["max_model_len"] * 0.7)  # Reduce context length for memory
-    
-    # Model size based adjustments with FIXED memory management
-    if any(size in model_lower for size in ["405b"]):
-        config["max_model_len"] = min(config["max_model_len"], 4096 if config["quantization"] else 2048)
-        config["max_num_seqs"] = 8 if config["quantization"] else 4
-        config["tensor_parallel_size"] = 8 if gpu_type == "B200" else 4
-    elif any(size in model_lower for size in ["70b", "72b"]):
-        config["max_model_len"] = min(config["max_model_len"], 4096 if config["quantization"] else 2048)
-        config["max_num_seqs"] = 6 if config["quantization"] else 3
-        config["tensor_parallel_size"] = 4 if gpu_type in ["H100", "H200", "B200"] else 2
-    elif any(size in model_lower for size in ["27b", "34b"]):
-        # CRITICAL FIX: Special handling for 34B models
-        if "34b" in model_lower:
-            config["max_model_len"] = min(config["max_model_len"], 1024)  # Very conservative for 34B
-            config["max_num_seqs"] = 1  # Single sequence only
-            config["tensor_parallel_size"] = 1  # Single GPU to avoid memory overhead
-            print("🔧 Applied EXTRA conservative settings for 34B model (1024 context, 1 seq)")
-        elif "27b" in model_lower:
-            config["max_model_len"] = min(config["max_model_len"], 2048 if config["quantization"] else 1024)
-            config["max_num_seqs"] = 2 if config["quantization"] else 1
-            config["tensor_parallel_size"] = 1  # Force single GPU for better memory efficiency
-            print("🔧 Applied conservative settings for 27B model")
-        config["tensor_parallel_size"] = 1  # Force single GPU for large models
-    elif any(size in model_lower for size in ["17b"]):
-        config["max_model_len"] = min(config["max_model_len"], 4096 if config["quantization"] else 2048)
-        config["max_num_seqs"] = 4 if config["quantization"] else 3
-        config["tensor_parallel_size"] = 2 if gpu_type in ["H100", "H200"] else 1
-    elif any(size in model_lower for size in ["7b", "8b", "9b", "12b", "13b", "14b"]):
-        if not model_config:
-            config["max_model_len"] = min(config["max_model_len"], 4096 if config["quantization"] else 2048)
-        config["max_num_seqs"] = 8 if config["quantization"] else 4
-        config["tensor_parallel_size"] = 2 if gpu_type in ["A100-40GB", "A100-80GB", "H100", "H200", "L40S"] else 1
-    elif any(size in model_lower for size in ["3b", "4b", "6b"]):
-        if not model_config:
-            config["max_model_len"] = min(config["max_model_len"], 4096)
-        config["max_num_seqs"] = 8
-    elif any(size in model_lower for size in ["1b", "2b", "tinyllama"]):
-        if not model_config:
-            config["max_model_len"] = min(config["max_model_len"], 4096)
-        config["max_num_seqs"] = 12
-    elif "dialog" in model_lower or "chat" in model_lower:
-        if not model_config:
-            config["max_model_len"] = min(config["max_model_len"], 1024)
-        config["max_num_seqs"] = 6
+    # GPU-specific optimizations
+    if gpu_type in ["H100", "H200", "B200"]:
+        config.update({
+            "n_ctx": 4096,
+            "n_batch": 1024,
+            "n_threads": 16
+        })
+    elif gpu_type in ["A100-80GB", "L40S"]:
+        config.update({
+            "n_ctx": 2048,
+            "n_batch": 512,
+            "n_threads": 12
+        })
+    elif gpu_type in ["L4", "A10G"]:
+        config.update({
+            "n_ctx": 1024,
+            "n_batch": 256,
+            "n_threads": 8
+        })
     
     # Model-specific adjustments
-    if "stablelm" in model_lower:
-        config["max_model_len"] = min(config["max_model_len"], 2048)
-        config["max_num_seqs"] = 2
-        config["dtype"] = "half"
-        config["trust_remote_code"] = True
+    if "34b" in model_lower:
+        config["n_ctx"] = min(config["n_ctx"], 1024)  # Conservative for 34B
+        config["n_batch"] = min(config["n_batch"], 256)
+    elif "moe" in model_lower:
+        config["n_gpu_layers"] = 20  # Partial GPU offload for MoE
+        config["n_ctx"] = min(config["n_ctx"], 2048)  # Conservative for MoE
     
-    # GPU-specific adjustments with memory-aware settings
-    if gpu_type == "T4":
-        config["max_model_len"] = min(config["max_model_len"], 2048)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 4)
-        config["dtype"] = "half"
-    elif gpu_type == "L4":
-        config["max_model_len"] = min(config["max_model_len"], 3072)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 6)
-        config["dtype"] = "half"
-    elif gpu_type == "A10G":
-        config["max_model_len"] = min(config["max_model_len"], 4096)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 8)
-        config["dtype"] = "auto"
-    elif gpu_type == "L40S":
-        config["max_model_len"] = min(config["max_model_len"], 4096)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 8)
-        config["dtype"] = "auto"
-    elif gpu_type == "A100-40GB":
-        config["max_model_len"] = min(config["max_model_len"], 4096)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 6)
-        config["dtype"] = "auto"
-    elif gpu_type == "A100-80GB":
-        # FIXED: More conservative settings for A100-80GB
-        config["max_model_len"] = min(config["max_model_len"], 4096)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 4)  # Reduced from 12 to 4
-        config["dtype"] = "auto"
-        print("🔧 Applied conservative A100-80GB memory settings")
-    elif gpu_type == "H100":
-        config["max_model_len"] = min(config["max_model_len"], 8192)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 12)
-        config["dtype"] = "auto"
-    elif gpu_type == "H200":
-        config["max_model_len"] = min(config["max_model_len"], 12288)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 20)
-        config["dtype"] = "auto"
-    elif gpu_type == "B200":
-        config["max_model_len"] = min(config["max_model_len"], 16384)
-        config["max_num_seqs"] = min(config["max_num_seqs"], 32)
-        config["dtype"] = "auto"
-    
-    # Ensure minimum viable values
-    config["max_model_len"] = max(config["max_model_len"], 512)
-    config["max_num_seqs"] = max(config["max_num_seqs"], 1)
+    # Chat format selection
+    if "llama" in model_lower:
+        config["chat_format"] = "llama-2"
+    elif "mistral" in model_lower:
+        config["chat_format"] = "mistral-instruct"
+    elif "yi" in model_lower or "qwen" in model_lower:
+        config["chat_format"] = "chatml"
     
     return config
 
-# --- Container image ---
+# --- Container image with llama-cpp ---
 base_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("curl", "git")
     .pip_install(
-        "torch==2.5.1",
-        "numpy<2.0",
-        "packaging",
-        "wheel",
-    )
-    .pip_install("vllm==0.10.0")
-    .pip_install(
-        "accelerate",
-        "openai", 
+        "llama-cpp-python[server]==0.3.15",  # Latest version with excellent MoE support
+        "fastapi",
+        "uvicorn", 
+        "pydantic",
         "huggingface_hub[hf_transfer]",
-        "tokenizers",
         "requests",
-        "auto-gptq>=0.7.1",
-        "autoawq>=0.2.6", 
-        "optimum",
-        "scipy",
-        "sentencepiece",
-        "protobuf",
         "psutil",
-        "pynvml",
-        "bitsandbytes>=0.43.0",  # Added for BnB quantization support
+        "prometheus_client"
     )
 )
 
-# --- Core chat function with FIXED memory management ---
-def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
-    """Core chat logic that runs the vLLM server and handles chat"""
-    gpu_type, gpu_memory_util = get_gpu_config(model_name)
+# --- Core chat function with llama-cpp ---
+def run_llamacpp_logic(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
+    """Core llama-cpp logic that runs the server and handles chat"""
+    if not is_gguf_model(model_name):
+        raise ValueError("Only GGUF models are supported in llama-cpp mode")
+    
+    gpu_config = get_gpu_config_llamacpp(model_name)
+    gpu_type, memory_util = gpu_config
+    moe_flag = ""  # No special MoE flags needed for llama-cpp
+    
     model_path = get_model_path_from_name(model_name)
     
     port = 8000
     
     print(f"🤖 Using model: {model_name}")
-    print(f"🔧 GPU: {gpu_type}, Memory utilization: {gpu_memory_util}")
+    print(f"🔧 GPU: {gpu_type}, Memory utilization: {memory_util}")
     print(f"📁 Model path: {model_path}")
     print(f"📦 Using persistent volume for model storage")
+    print(f"🦙 Engine: llama-cpp-python v0.3.15")
     
     # Download model if it doesn't exist
     if not model_path.exists():
@@ -699,324 +331,19 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
     if not model_path.exists():
         raise RuntimeError(f"Model path {model_path} does not exist after download")
     
-    # NEW: Set up chat template if missing
-    setup_chat_template(model_path, model_name)
-    
-    # Check if model is sharded
-    is_sharded, shard_count, shard_files = check_model_sharding(model_path)
-    
-    # Read model config
-    model_config = get_model_config(model_path)
-    
-    # Check compatibility
-    if not is_model_supported(model_config, model_name):
-        print("⚠️ This model may have compatibility issues with vLLM 0.9.1")
-        print("💡 Consider using one of these well-supported alternatives:")
-        print("   - TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-        print("   - Qwen/Qwen2.5-3B-Instruct")
-        print("   - 01-ai/Yi-1.5-6B-Chat")
-        print("   - unsloth/mistral-7b-v0.2")
-        print("\n🎯 Attempting to start anyway with conservative settings...")
-    
-    # Show model files summary
-    files = list(model_path.glob("*"))
-    print(f"📁 Model directory contains {len(files)} files")
-    
-    # Calculate total size
-    total_size = 0
-    for file in files:
-        if file.is_file():
-            total_size += file.stat().st_size
-    
-    print(f"💾 Total model size: {total_size / 1e9:.2f} GB")
-    if is_sharded:
-        print(f"🔗 Model is sharded across {shard_count} files")
-    
-    # CRITICAL FIX: Better memory management for large models
-    model_size_gb = total_size / 1e9
-    model_lower = model_name.lower()
-    
-    # Apply memory fixes based on model size and type
-    if model_size_gb > 60:  # Very large models (34B+)
-        gpu_memory_util = min(gpu_memory_util, 0.60)  # Very conservative
-        print(f"🔧 Applied large model memory fix: {gpu_memory_util*100}% GPU memory")
-    elif model_size_gb > 40:  # Large models (27B)
-        gpu_memory_util = min(gpu_memory_util, 0.70)  # Conservative
-        print(f"🔧 Applied medium-large model memory fix: {gpu_memory_util*100}% GPU memory")
-    elif is_sharded and shard_count >= 10:  # Many shards
-        gpu_memory_util = min(gpu_memory_util, 0.75)
-        print(f"🔧 Applied multi-shard memory fix: {gpu_memory_util*100}% GPU memory")
-    
-    # Force H100 for 34B models if user somehow got A100
-    if "34b" in model_lower and gpu_type == "A100-80GB":
-        print("⚠️ WARNING: 34B model detected on A100-80GB")
-        print("💡 This model requires H100 for reliable operation")
-        print("🔧 Applying emergency memory settings...")
-        gpu_memory_util = 0.55  # Emergency low memory setting
+    # Get GGUF file
+    gguf_file_path = get_gguf_file_path(model_path)
+    size_gb = gguf_file_path.stat().st_size / 1e9
+    print(f"📊 Using GGUF file: {gguf_file_path.name} ({size_gb:.1f} GB)")
     
     # Get configuration
-    vllm_config = get_vllm_config(model_name, gpu_type, model_config, is_sharded)
+    config = get_llamacpp_config(model_name, gpu_type, gguf_file_path)
     
-    # Additional fixes for large sharded models
-    if is_sharded and shard_count >= 10:
-        # Force single GPU for very large sharded models
-        vllm_config["tensor_parallel_size"] = 1
-        # Extremely conservative sequence settings
-        vllm_config["max_num_seqs"] = 1
-        print(f"🔧 Applied large sharded model fixes: TP=1, max_seqs=1")
+    # Start llama-cpp server
+    llamacpp_process = run_llamacpp_server(gguf_file_path, config, moe_flag, port)
     
-    # CRITICAL FIX: Calculate proper batch tokens
-    max_batch_tokens = max(
-        vllm_config["max_model_len"],  # Must be at least as large as max_model_len
-        vllm_config["max_num_seqs"] * min(512, vllm_config["max_model_len"])  # Conservative batch size
-    )
-    
-    # Build vLLM command with FIXED parameters and GGUF support
-    if is_gguf_model(model_name):
-        # For GGUF models, use the specific .gguf file path as string
-        gguf_file_path = get_gguf_file_path(model_path)
-        model_arg = str(gguf_file_path)
-        # CRITICAL: For GGUF, tokenizer should use the model directory, not the file
-        tokenizer_arg = str(model_path)
-        print(f"🔧 Using GGUF file: {gguf_file_path.name}")
-        print(f"🔧 Using tokenizer path: {model_path}")
-    else:
-        # For other models, use the directory path
-        model_arg = str(model_path)
-        tokenizer_arg = str(model_path)
-    
-    vllm_command = [
-        "python", "-m", "vllm.entrypoints.openai.api_server",
-        "--host", "0.0.0.0", 
-        "--port", str(port),
-        "--model", model_arg,
-        "--served-model-name", model_name,
-        "--tensor-parallel-size", str(vllm_config["tensor_parallel_size"]),
-        "--max-model-len", str(vllm_config["max_model_len"]),
-        "--gpu-memory-utilization", str(gpu_memory_util),
-        "--max-num-batched-tokens", str(max_batch_tokens),  # FIXED: Proper calculation
-        "--disable-log-requests",
-        "--tokenizer-mode", "auto",
-        "--dtype", vllm_config["dtype"],
-        "--max-num-seqs", str(vllm_config["max_num_seqs"]),  # Explicitly set max sequences
-    ]
-    
-    # CRITICAL: For GGUF models, add separate tokenizer path
-    if is_gguf_model(model_name):
-        vllm_command.extend(["--tokenizer", tokenizer_arg])
-        print(f"🔧 Added separate tokenizer path for GGUF: {tokenizer_arg}")
-    
-    # FIXED: Only add FP8 KV cache for non-quantized models
-    if model_size_gb > 30 and gpu_type in ["H100", "H200", "B200"] and not vllm_config["quantization"]:
-        vllm_command.extend(["--kv-cache-dtype", "fp8"])
-        print("🔧 Enabled FP8 KV cache for large model memory optimization")
-    elif vllm_config["quantization"]:
-        print(f"🔧 Skipped FP8 KV cache for {vllm_config['quantization']} quantization compatibility")
-    
-    # Conditional flags for better compatibility
-    if not (is_sharded and shard_count >= 10):
-        vllm_command.append("--enable-prefix-caching")
-    else:
-        print("🔧 Disabled prefix caching for large sharded model compatibility")
-    
-    if vllm_config.get("trust_remote_code", False):
-        vllm_command.append("--trust-remote-code")
-    
-    if vllm_config["quantization"]:
-        vllm_command.extend(["--quantization", vllm_config["quantization"]])
-        print(f"🔧 Detected quantization: {vllm_config['quantization']}")
-    
-    # Special handling for large sharded models
-    if is_sharded and shard_count >= 10:
-        print(f"🔗 Large sharded model detected ({shard_count} shards)")
-        # Force specific load format
-        vllm_command.extend(["--load-format", "safetensors"])
-        # Disable problematic optimizations
-        vllm_command.extend(["--disable-custom-all-reduce"])
-        # Force block size for memory efficiency
-        vllm_command.extend(["--block-size", "16"])  # Increased from 8 to 16 for better performance
-    else:
-        # Standard optimizations for smaller models
-        if gpu_type in ["H100", "H200", "B200"] and not ("34b" in model_lower):
-            vllm_command.append("--enable-chunked-prefill")
-        elif gpu_type == "L4":
-            vllm_command.extend([
-                "--block-size", "16",
-                "--swap-space", "4",
-            ])
-        elif gpu_type in ["L40S", "A100-40GB", "A100-80GB"]:
-            vllm_command.extend([
-                "--block-size", "16",
-                "--swap-space", "4",
-            ])
-    
-    print("🚀 Starting vLLM server...")
-    print(f"⚙️ Config: max_len={vllm_config['max_model_len']}, tensor_parallel={vllm_config['tensor_parallel_size']}, dtype={vllm_config['dtype']}")
-    print(f"💾 Memory: {gpu_memory_util*100}% GPU, max_seqs={vllm_config['max_num_seqs']}, batch_tokens={max_batch_tokens}")
-    if vllm_config["quantization"]:
-        print(f"🗜️ Quantization: {vllm_config['quantization']}")
-    if is_sharded:
-        print(f"🔗 Sharded model loading enabled with compatibility fixes")
-    print(f"💬 Chat template setup completed for RP compatibility")
-    
-    # Environment setup with FIXED memory settings
-    env = os.environ.copy()
-    env["VLLM_USE_MODELSCOPE"] = "False"
-    env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-    env["CUDA_VISIBLE_DEVICES"] = "0"
-    env["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
-    
-    # Memory-specific environment settings
-    if model_size_gb > 60:  # 34B+ models
-        env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
-        env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN" 
-        env["TOKENIZERS_PARALLELISM"] = "false"
-        env["VLLM_USE_RAY_COMPILED_DAG"] = "0"
-        env["VLLM_USE_RAY_SPMD_WORKER"] = "0"
-        print("🔧 Applied 34B+ model environment optimizations")
-    elif is_sharded:
-        env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
-        env["TOKENIZERS_PARALLELISM"] = "false"
-        if shard_count >= 10:
-            env["VLLM_USE_RAY_COMPILED_DAG"] = "0"
-            env["VLLM_USE_RAY_SPMD_WORKER"] = "0"
-            print("🔧 Applied large sharded model environment fixes")
-    
-    # GPU-specific environment settings  
-    if gpu_type == "L4":
-        env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
-        env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
-    elif gpu_type in ["L40S", "A100-40GB", "A100-80GB"]:
-        env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
-        env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
-    elif gpu_type in ["H100", "H200", "B200"]:
-        env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
-        env["VLLM_USE_TRITON_FLASH_ATTN"] = "1"
-    
-    # Add timeout handling for stuck processes
-    print(f"🔧 Command: {' '.join(vllm_command)}")
-    
-    vllm_process = subprocess.Popen(
-        vllm_command, 
-        stdout=subprocess.PIPE, 
-        stderr=subprocess.STDOUT, 
-        text=True,
-        bufsize=1,
-        env=env
-    )
-    
-    # Wait for startup (longer timeout for sharded models)
-    max_retries = 600 if is_sharded and shard_count >= 10 else 300
-    output_lines = []
-    stuck_counter = 0
-    last_output_time = time.time()
-    
-    if is_sharded:
-        print(f"⏳ Large sharded model loading may take 10-20 minutes...")
-        print(f"⏰ Will wait up to {max_retries//30} minutes for loading to complete")
-    
-    for i in range(max_retries):
-        if vllm_process.poll() is not None:
-            try:
-                remaining_output = vllm_process.stdout.read()
-                if remaining_output:
-                    output_lines.extend(remaining_output.split('\n'))
-            except:
-                pass
-            
-            print(f"❌ vLLM process terminated with code: {vllm_process.returncode}")
-            print(f"📝 Process output (last 50 lines):")
-            for line in output_lines[-50:]:
-                if line.strip():
-                    print(f"   {line.strip()}")
-            
-            # Enhanced error hints
-            output_text = '\n'.join(output_lines)
-            if "out of memory" in output_text.lower() or "available kv cache memory" in output_text.lower():
-                print(f"\n💡 GPU Memory Issue Detected!")
-                print(f"   Model size: {model_size_gb:.1f} GB on {gpu_type}")
-                if "34b" in model_lower:
-                    print(f"   34B models need H100 (80GB) for reliable operation")
-                    print(f"   Try: MODEL_NAME='01-ai/Yi-1.5-6B-Chat' modal run vllmserver.py::serve_api")
-                elif model_size_gb > 40:
-                    print(f"   Large model needs more GPU memory or quantization")
-                    print(f"   Try a smaller model or find a quantized version")
-                else:
-                    print(f"   Try reducing max_model_len or using a larger GPU")
-            elif "max_num_batched_tokens" in output_text.lower():
-                print(f"\n💡 Batch token configuration error - this should now be fixed!")
-                print(f"   Batch tokens: {max_batch_tokens}, Max model len: {vllm_config['max_model_len']}")
-            elif "chat template" in output_text.lower():
-                print(f"\n💡 Chat template error detected!")
-                print(f"   This should be fixed with the chat template setup")
-                print(f"   Check if tokenizer_config.json was properly updated")
-            elif "quantization" in output_text.lower() and "does not match" in output_text.lower():
-                print(f"\n💡 Quantization mismatch detected!")
-                print(f"   Model uses different quantization than detected")
-                print(f"   Detected: {vllm_config['quantization']}")
-                print(f"   Try without quantization override or use a different model")
-            elif "engine core initialization failed" in output_text.lower():
-                print(f"\n💡 Hint: Model '{model_name}' may not be fully compatible with vLLM 0.9.1")
-                print("   Try these well-supported alternatives:")
-                print("   - TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-                print("   - Qwen/Qwen2.5-3B-Instruct")
-                print("   - 01-ai/Yi-1.5-6B-Chat")
-            elif is_sharded and ("load" in output_text.lower() or "cuda" in output_text.lower()):
-                print(f"\n💡 Sharded model loading issue.")
-                print(f"   Try: MODEL_NAME='Qwen/Qwen2.5-3B-Instruct' modal run vllmserver.py::serve_api")
-            
-            raise RuntimeError(f"vLLM failed to start (exit code: {vllm_process.returncode})")
-        
-        try:
-            line = vllm_process.stdout.readline()
-            if line and line.strip():
-                output_lines.append(line.strip())
-                last_output_time = time.time()
-                stuck_counter = 0
-                
-                # Show important progress lines
-                if any(keyword in line.lower() for keyword in ["loading", "shard", "cuda", "memory", "model", "initialized", "kv cache"]):
-                    print(f"   🔗 {line.strip()}")
-                elif i % 30 == 0:
-                    print(f"   {line.strip()}")
-            else:
-                # Check if we're stuck
-                if time.time() - last_output_time > 300:  # 5 minutes without output
-                    stuck_counter += 1
-                    if stuck_counter >= 3:
-                        print(f"⚠️ Process appears stuck (no output for {(time.time() - last_output_time):.0f}s)")
-                        print(f"💡 Try a smaller model:")
-                        print(f"   MODEL_NAME='01-ai/Yi-1.5-6B-Chat' modal run vllmserver.py::serve_api")
-                        vllm_process.terminate()
-                        raise RuntimeError("Process stuck during model loading")
-        except:
-            pass
-        
-        # Test if server is ready
-        try:
-            result = subprocess.run(
-                ["curl", "-f", f"http://localhost:{port}/health"],
-                check=True, capture_output=True, timeout=5
-            )
-            print("✅ vLLM server is ready!")
-            if is_sharded:
-                print(f"🔗 Sharded model loaded successfully!")
-            print("💬 Chat template configured for RP compatibility!")
-            break
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            if i % 60 == 0:
-                elapsed_min = (i * 2) // 60
-                print(f"⏳ Waiting for server... ({elapsed_min} min elapsed, max {max_retries//30} min)")
-                if is_sharded and i > 0:
-                    print(f"   🔗 Large sharded models can take 10-20 minutes to load...")
-            time.sleep(2)
-    else:
-        print("⏰ Startup timeout reached!")
-        print(f"💡 Model may be too large for current GPU configuration")
-        print(f"💡 Try a smaller model:")
-        print(f"   MODEL_NAME='01-ai/Yi-1.5-6B-Chat' modal run vllmserver.py::serve_api")
-        vllm_process.terminate()
-        raise RuntimeError("vLLM server failed to start within timeout period")
+    # Wait for startup (MoE models need more time) with real-time logging
+    wait_for_server_ready(port, max_wait=180, process=llamacpp_process)
     
     # Server ready - continue with API/chat logic
     with modal.forward(port) as tunnel:
@@ -1043,11 +370,11 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             print(f"  - Models: {tunnel.url}/v1/models")
             print(f"  - Chat: {tunnel.url}/v1/chat/completions")
             print(f"  - Completions: {tunnel.url}/v1/completions")
-            if is_sharded:
-                print(f"🔗 Serving sharded model with {shard_count} parts")
-            print(f"💾 Model size: {model_size_gb:.1f} GB on {gpu_type}")
-            print(f"💬 Chat template configured for RP compatibility!")
-            print(f"🗜️ Quantization: {vllm_config['quantization']}")
+            print(f"💾 Model size: {size_gb:.1f} GB on {gpu_type}")
+            print(f"💬 Chat format: {config['chat_format']}")
+            print(f"🗜️ Quantization: GGUF built-in")
+            if moe_flag:
+                print(f"🔀 MoE optimization: {moe_flag}")
             print("\n⏰ Server running indefinitely. Modal will auto-scale down after inactivity.")
             print("💡 Press Ctrl+C to stop the server manually.")
             
@@ -1059,7 +386,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
                 print("\n🛑 Stopping server...")
                 return
             finally:
-                vllm_process.terminate()
+                llamacpp_process.terminate()
         
         elif custom_questions is None or len(custom_questions) == 0:
             print("\n🧪 API demo mode - server will stay alive for 5 minutes for testing")
@@ -1069,10 +396,8 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             print(f"  - Models: {tunnel.url}/v1/models")
             print(f"  - Completions: {tunnel.url}/v1/completions")
             print(f"  - Chat: {tunnel.url}/v1/chat/completions")
-            if is_sharded:
-                print(f"🔗 Serving sharded model with {shard_count} parts")
-            print(f"💬 Chat template configured for RP compatibility!")
-            print(f"🗜️ Quantization: {vllm_config['quantization']}")
+            print(f"💬 Chat format: {config['chat_format']}")
+            print(f"🗜️ Quantization: GGUF built-in")
             
             print("\n⏰ Keeping server alive for 5 minutes for testing...")
             try:
@@ -1080,7 +405,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             except KeyboardInterrupt:
                 print("\n🛑 Stopping server...")
             finally:
-                vllm_process.terminate()
+                llamacpp_process.terminate()
             return
         
         else:
@@ -1094,11 +419,11 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             conversation = []
             print(f"\n{'='*60}")
             print(f"🤖 Chat Session with {model_name}")
-            if is_sharded:
-                print(f"🔗 Using sharded model with {shard_count} parts")
-            print(f"📊 Model: {model_size_gb:.1f} GB on {gpu_type}")
-            print(f"💬 Chat template: Configured for RP compatibility")
-            print(f"🗜️ Quantization: {vllm_config['quantization']}")
+            print(f"📊 Model: {size_gb:.1f} GB on {gpu_type}")
+            print(f"💬 Chat format: {config['chat_format']}")
+            print(f"🗜️ Quantization: GGUF built-in")
+            if moe_flag:
+                print(f"🔀 MoE optimization: {moe_flag}")
             print(f"{'='*60}\n")
             
             for question in questions:
@@ -1108,15 +433,15 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
                 try:
                     response = requests.post(
                         f"http://localhost:{port}/v1/chat/completions",
-                        headers={"Content-Type": "application/json", "Authorization": "Bearer vllm"},
+                        headers={"Content-Type": "application/json"},
                         json={
-                            "model": model_name,
+                            "model": gguf_file_path.name,
                             "messages": conversation,
-                            "max_tokens": min(200, vllm_config["max_model_len"] // 6),  # Smaller response for memory
+                            "max_tokens": min(200, config["n_ctx"] // 6),
                             "temperature": 0.8,
                             "top_p": 0.9,
                         },
-                        timeout=120 if is_sharded else 90
+                        timeout=120
                     )
                     
                     if response.status_code == 200:
@@ -1134,7 +459,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             print("✅ Chat session completed!")
             print(f"🌐 Server is still running at: {tunnel.url}")
             print(f"💬 Ready for RP proxy connections!")
-            print(f"🗜️ Using {vllm_config['quantization']} quantization")
+            print(f"🗜️ Using GGUF built-in quantization")
             
             print("\n⏰ Keeping server alive for 5 minutes for additional testing...")
             try:
@@ -1142,7 +467,157 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
             except KeyboardInterrupt:
                 print("\n🛑 Stopping server...")
             finally:
-                vllm_process.terminate()
+                llamacpp_process.terminate()
+
+def run_llamacpp_server(gguf_file_path: Path, config: dict, moe_flag: str = "", port: int = 8000):
+    """Start llama-cpp OpenAI-compatible server with real-time logging"""
+    command = [
+        "python", "-m", "llama_cpp.server",
+        "--model", str(gguf_file_path),
+        "--host", "0.0.0.0",
+        "--port", str(port),
+        "--n_ctx", str(config["n_ctx"]),
+        "--n_batch", str(config["n_batch"]),
+        "--n_gpu_layers", str(config["n_gpu_layers"]),
+        "--chat_format", config["chat_format"]
+    ]
+    
+    # Optional flags
+    if config.get("use_mmap"):
+        command.extend(["--use_mmap", "true"])
+    if config.get("use_mlock"):
+        command.extend(["--use_mlock", "true"])
+    
+    # MoE flag if provided
+    if moe_flag:
+        command.extend(moe_flag.split())
+    
+    # Environment setup
+    env = os.environ.copy()
+    env.update({
+        "CUDA_VISIBLE_DEVICES": "0",
+        "GGML_CUDA_ENABLE": "1",
+        "GGML_CUDA_F16": "1"  # FP16 for better performance
+    })
+    
+    print(f"🚀 Starting llama-cpp server...")
+    print(f"📁 Model: {gguf_file_path.name}")
+    print(f"📊 Model size: {gguf_file_path.stat().st_size / 1e9:.1f} GB")
+    print(f"⚙️ Config: ctx={config['n_ctx']}, batch={config['n_batch']}, gpu_layers={config['n_gpu_layers']}")
+    print(f"💬 Chat format: {config['chat_format']}")
+    if moe_flag:
+        print(f"🔀 MoE optimization: {moe_flag}")
+    print(f"🔧 Command: {' '.join(command)}")
+    print(f"🌍 Environment vars: CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')}")
+    print(f"🌍 GGML_CUDA_ENABLE={env.get('GGML_CUDA_ENABLE')}, GGML_CUDA_F16={env.get('GGML_CUDA_F16')}")
+    
+    # Start server process
+    process = subprocess.Popen(
+        command, 
+        env=env, 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.STDOUT, 
+        text=True,
+        bufsize=1
+    )
+    
+    print(f"📦 Server process started (PID: {process.pid})")
+    print(f"📄 Server logs will stream below:")
+    print("=" * 60)
+    
+    return process
+
+def wait_for_server_ready(port: int = 8000, max_wait: int = 120, process=None):
+    """Wait for llama-cpp server to be ready with real-time log streaming"""
+    print(f"⏳ Waiting for llama-cpp server to start (max {max_wait}s)...")
+    
+    import threading
+    import queue
+    
+    # Queue for log messages
+    log_queue = queue.Queue()
+    log_thread = None
+    
+    # Start log reading thread if process is provided
+    if process:
+        def read_logs():
+            while True:
+                try:
+                    line = process.stdout.readline()
+                    if not line:
+                        break
+                    log_queue.put(line.strip())
+                except:
+                    break
+        
+        log_thread = threading.Thread(target=read_logs, daemon=True)
+        log_thread.start()
+        print("📄 Starting real-time log streaming...")
+    
+    for i in range(max_wait):
+        # Check for new log messages
+        while not log_queue.empty():
+            try:
+                log_line = log_queue.get_nowait()
+                if log_line:
+                    print(f"🦙 SERVER: {log_line}")
+            except queue.Empty:
+                break
+        
+        # Check if server is ready
+        try:
+            import requests
+            response = requests.get(f"http://localhost:{port}/health", timeout=2)
+            if response.status_code == 200:
+                print("✅ llama-cpp server is ready!")
+            
+            # Read any remaining logs
+            if process:
+                for _ in range(10):  # Read up to 10 more log lines
+                    try:
+                        log_line = log_queue.get_nowait()
+                        if log_line:
+                            print(f"🦙 SERVER: {log_line}")
+                    except queue.Empty:
+                        break
+            
+            return True
+        except:
+            if i % 15 == 0 and i > 0:
+                print(f"⏳ Still waiting... ({i}s/{max_wait}s)")
+                # Check process status
+                if process and process.poll() is not None:
+                    print(f"❌ Server process ended with code: {process.returncode}")
+                    # Read final logs
+                    while not log_queue.empty():
+                        try:
+                            log_line = log_queue.get_nowait()
+                            if log_line:
+                                print(f"🦙 SERVER: {log_line}")
+                        except queue.Empty:
+                            break
+                    raise RuntimeError(f"Server process died with exit code {process.returncode}")
+            time.sleep(1)
+    
+    # Timeout reached - show final status
+    print(f"⏰ Timeout reached after {max_wait}s")
+    if process:
+        if process.poll() is None:
+            print(f"📦 Server process is still running (PID: {process.pid})")
+        else:
+            print(f"❌ Server process ended with code: {process.returncode}")
+        
+        # Read final logs
+        print("📄 Final server logs:")
+        while not log_queue.empty():
+            try:
+                log_line = log_queue.get_nowait()
+                if log_line:
+                    print(f"🦙 SERVER: {log_line}")
+            except queue.Empty:
+                break
+    
+    raise RuntimeError("llama-cpp server failed to start within timeout")
 
 # --- GPU-specific functions with volumes ---
 @app.function(
@@ -1153,7 +628,7 @@ def run_chat_logic(model_name: str, custom_questions: Optional[list] = None, api
     volumes={"/models": default_volume}
 )
 def run_chat_t4(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
-    return run_chat_logic(model_name, custom_questions, api_only)
+    return run_llamacpp_logic(model_name, custom_questions, api_only)
 
 @app.function(
     gpu="L4", 
@@ -1163,7 +638,7 @@ def run_chat_t4(model_name: str, custom_questions: Optional[list] = None, api_on
     volumes={"/models": default_volume}
 )
 def run_chat_l4(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
-    return run_chat_logic(model_name, custom_questions, api_only)
+    return run_llamacpp_logic(model_name, custom_questions, api_only)
 
 @app.function(
     gpu="A10G", 
@@ -1173,7 +648,7 @@ def run_chat_l4(model_name: str, custom_questions: Optional[list] = None, api_on
     volumes={"/models": default_volume}
 )
 def run_chat_a10g(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
-    return run_chat_logic(model_name, custom_questions, api_only)
+    return run_llamacpp_logic(model_name, custom_questions, api_only)
 
 @app.function(
     gpu="L40S", 
@@ -1183,7 +658,7 @@ def run_chat_a10g(model_name: str, custom_questions: Optional[list] = None, api_
     volumes={"/models": default_volume}
 )
 def run_chat_l40s(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
-    return run_chat_logic(model_name, custom_questions, api_only)
+    return run_llamacpp_logic(model_name, custom_questions, api_only)
 
 @app.function(
     gpu="A100", 
@@ -1193,7 +668,7 @@ def run_chat_l40s(model_name: str, custom_questions: Optional[list] = None, api_
     volumes={"/models": default_volume}
 )
 def run_chat_a100_40gb(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
-    return run_chat_logic(model_name, custom_questions, api_only)
+    return run_llamacpp_logic(model_name, custom_questions, api_only)
 
 @app.function(
     gpu="A100-80GB", 
@@ -1203,7 +678,7 @@ def run_chat_a100_40gb(model_name: str, custom_questions: Optional[list] = None,
     volumes={"/models": default_volume}
 )  
 def run_chat_a100_80gb(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
-    return run_chat_logic(model_name, custom_questions, api_only)
+    return run_llamacpp_logic(model_name, custom_questions, api_only)
 
 @app.function(
     gpu="H100", 
@@ -1213,7 +688,7 @@ def run_chat_a100_80gb(model_name: str, custom_questions: Optional[list] = None,
     volumes={"/models": default_volume}
 )
 def run_chat_h100(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
-    return run_chat_logic(model_name, custom_questions, api_only)
+    return run_llamacpp_logic(model_name, custom_questions, api_only)
 
 @app.function(
     gpu="H200", 
@@ -1223,7 +698,7 @@ def run_chat_h100(model_name: str, custom_questions: Optional[list] = None, api_
     volumes={"/models": default_volume}
 )
 def run_chat_h200(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
-    return run_chat_logic(model_name, custom_questions, api_only)
+    return run_llamacpp_logic(model_name, custom_questions, api_only)
 
 @app.function(
     gpu="B200", 
@@ -1233,12 +708,16 @@ def run_chat_h200(model_name: str, custom_questions: Optional[list] = None, api_
     volumes={"/models": default_volume}
 )
 def run_chat_b200(model_name: str, custom_questions: Optional[list] = None, api_only: bool = False):
-    return run_chat_logic(model_name, custom_questions, api_only)
+    return run_llamacpp_logic(model_name, custom_questions, api_only)
 
 # --- Helper function ---
 def get_chat_function(model_name: str):
     """Get the appropriate chat function based on model requirements"""
-    gpu_type, _ = get_gpu_config(model_name)
+    gpu_config = get_gpu_config_llamacpp(model_name)
+    if len(gpu_config) >= 2:
+        gpu_type = gpu_config[0]
+    else:
+        gpu_type = "L4"
     
     function_map = {
         "T4": run_chat_t4,
@@ -1266,8 +745,7 @@ def download_model_remote(model_name: str):
     print(f"📥 Downloading model to volume: {model_name}")
     model_path = get_model_path_from_name(model_name)
     download_model_to_path(model_name, model_path)
-    setup_chat_template(model_path, model_name)
-    return f"✅ Model {model_name} downloaded and chat template configured!"
+    return f"✅ Model {model_name} downloaded successfully!"
 
 @app.function(
     image=base_image,
@@ -1284,40 +762,22 @@ def list_model_files():
     files = list(model_path.glob("*"))
     total_size = sum(f.stat().st_size for f in files if f.is_file())
     
-    # Check if sharded
-    is_sharded, shard_count, shard_files = check_model_sharding(model_path)
-    
-    # Check chat template
-    tokenizer_config_path = model_path / "tokenizer_config.json"
-    has_chat_template = False
-    if tokenizer_config_path.exists():
-        try:
-            with open(tokenizer_config_path, 'r') as f:
-                config = json.load(f)
-            has_chat_template = bool(config.get("chat_template"))
-        except:
-            pass
+    # Check GGUF files
+    gguf_files = list(model_path.glob("*.gguf"))
     
     result = [f"📁 Model: {model_name}"]
     result.append(f"📦 Using persistent volume storage")
     result.append(f"📁 Path: {model_path}")
     result.append(f"📊 Total size: {total_size / 1e9:.2f} GB")
-    result.append(f"💬 Chat template: {'✅ Configured' if has_chat_template else '❌ Missing'}")
-    if is_sharded:
-        result.append(f"🔗 Sharded model with {shard_count} parts")
+    result.append(f"🗜️ GGUF files: {len(gguf_files)}")
     result.append(f"📄 Files ({len(files)}):")
     
     for file in sorted(files):
         if file.is_file():
             size_mb = file.stat().st_size / 1e6
-            # Mark shard files
-            shard_marker = " 🔗" if file.name in shard_files else ""
-            # Mark chat template config
-            if file.name == "tokenizer_config.json":
-                chat_marker = " 💬"
-            else:
-                chat_marker = ""
-            result.append(f"   ✅ {file.name} ({size_mb:.1f} MB){shard_marker}{chat_marker}")
+            # Mark GGUF files
+            gguf_marker = " 🗜️" if file.name.endswith('.gguf') else ""
+            result.append(f"   ✅ {file.name} ({size_mb:.1f} MB){gguf_marker}")
         else:
             result.append(f"   📁 {file.name}/")
     
@@ -1419,15 +879,15 @@ def cleanup_gguf_model(model_name: str):
 @app.local_entrypoint()
 def chat(questions: str = ""):
     current_model = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
-    gpu_type, _ = get_gpu_config(current_model)
+    gpu_config = get_gpu_config_llamacpp(current_model)
+    gpu_type = gpu_config[0] if len(gpu_config) >= 1 else "L4"
     
     print(f"🚀 Starting chat session...")
     print(f"🤖 Model: {current_model}")
     print(f"🔧 GPU: {gpu_type}")
     print(f"📦 Using persistent volume for model storage")
-    print(f"💬 Chat template will be configured for RP compatibility")
-    print(f"🔗 Enhanced memory management enabled")
-    print(f"🗜️ Fixed quantization detection (BnB/GPTQ/AWQ)")
+    print(f"🦙 Engine: llama-cpp-python v0.2.24")
+    print(f"🗜️ GGUF Q8_0 quantization support")
     
     custom_questions = None
     if questions:
@@ -1440,15 +900,15 @@ def chat(questions: str = ""):
 @app.local_entrypoint()
 def serve_api():
     current_model = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
-    gpu_type, _ = get_gpu_config(current_model)
+    gpu_config = get_gpu_config_llamacpp(current_model)
+    gpu_type = gpu_config[0] if len(gpu_config) >= 1 else "L4"
     
     print(f"🌐 Starting API-only server...")
     print(f"🤖 Model: {current_model}")
     print(f"🔧 GPU: {gpu_type}")
     print(f"📦 Using persistent volume for model storage")
-    print(f"💬 Chat template will be configured for RP compatibility")
-    print(f"🔗 Enhanced memory management enabled")
-    print(f"🗜️ Fixed quantization detection (BnB/GPTQ/AWQ)")
+    print(f"🦙 Engine: llama-cpp-python v0.2.24")
+    print(f"🗜️ GGUF Q8_0 quantization support")
     
     chat_func = get_chat_function(current_model)
     chat_func.remote(current_model, custom_questions=None, api_only=True)
@@ -1456,189 +916,123 @@ def serve_api():
 @app.local_entrypoint()
 def serve_demo():
     current_model = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
-    gpu_type, _ = get_gpu_config(current_model)
+    gpu_config = get_gpu_config_llamacpp(current_model)
+    gpu_type = gpu_config[0] if len(gpu_config) >= 1 else "L4"
     
     print(f"🧪 Starting API demo server (5 minutes)...")
     print(f"🤖 Model: {current_model}")
     print(f"🔧 GPU: {gpu_type}")
     print(f"📦 Using persistent volume for model storage")
-    print(f"💬 Chat template will be configured for RP compatibility")
-    print(f"🔗 Enhanced memory management enabled")
-    print(f"🗜️ Fixed quantization detection (BnB/GPTQ/AWQ)")
+    print(f"🦙 Engine: llama-cpp-python v0.2.24")
+    print(f"🗜️ GGUF Q8_0 quantization support")
     
     chat_func = get_chat_function(current_model)
     chat_func.remote(current_model, custom_questions=[], api_only=False)
 
 @app.local_entrypoint()
-def test_working_model():
-    """Test with a known working model"""
-    model_name = "Qwen/Qwen2.5-3B-Instruct"
-    print(f"🧪 Testing known working model: {model_name}")
-    print(f"💬 Chat template will be automatically configured")
+def test_gguf_q8():
+    """Test GGUF Q8_0 quantization with default model"""
+    model_name = DEFAULT_MODEL
+    print(f"🧪 Testing GGUF Q8_0 quantization: {model_name}")
+    print(f"🔧 This will automatically select H100 for 18.4B MoE GGUF")
+    print(f"🗜️ Q8_0 format with built-in quantization")
+    print(f"🦙 Using llama-cpp-python for optimal GGUF support")
     
     chat_func = get_chat_function(model_name)
     chat_func.remote(model_name, [
-        "Hello! Testing with a reliable 3B model.",
-        "What is machine learning?",
-        "Thank you!"
+        "Hello! Testing GGUF Q8_0 quantization with llama-cpp.",
+        "What is a Mixture of Experts model and how does it work?",
+        "Thank you for demonstrating Q8_0 quantization!"
     ], api_only=False)
 
 @app.local_entrypoint()
-def test_medium_model():
-    """Test with 6B model"""
-    model_name = "01-ai/Yi-1.5-6B-Chat"
-    print(f"🧪 Testing medium model: {model_name}")
-    print(f"💬 Chat template will be automatically configured")
+def test_small_gguf():
+    """Test with a smaller GGUF model"""
+    model_name = "microsoft/Phi-3-mini-4k-instruct-gguf"
+    print(f"🧪 Testing small GGUF model: {model_name}")
+    print(f"🦙 Using llama-cpp-python for GGUF support")
     
     chat_func = get_chat_function(model_name)
     chat_func.remote(model_name, [
-        "Hello! Testing a 6B model.",
-        "Explain artificial intelligence briefly.",
-        "Thank you for the demo!"
-    ], api_only=False)
-
-@app.local_entrypoint()
-def test_large_model_h100():
-    """Test 34B model on H100 (will force H100 selection)"""
-    model_name = "01-ai/Yi-1.5-34B-Chat"
-    print(f"🧪 Testing large model with H200: {model_name}")
-    print(f"⚙️ This will automatically select H200 for proper memory handling")
-    print(f"💬 Chat template will be automatically configured")
-    
-    chat_func = get_chat_function(model_name)
-    chat_func.remote(model_name, [
-        "Hello! I'm testing a 34B model with proper GPU selection.",
-        "What are the key principles of good software design?",
+        "Hello! Testing a small GGUF model with llama-cpp.",
+        "What are the benefits of GGUF format?",
         "Thank you for the demonstration!"
     ], api_only=False)
 
 @app.local_entrypoint()
-def test_rp_compatibility():
-    """Test with RP-friendly model"""
-    model_name = "01-ai/Yi-1.5-6B-Chat"
-    print(f"🧪 Testing RP compatibility with: {model_name}")
-    print(f"💬 Specifically configuring for RP proxy support")
-    
-    chat_func = get_chat_function(model_name)
-    chat_func.remote(model_name, [
-        "Hello! I'm a character you're chatting with. How are you today?",
-        "*smiles warmly* What would you like to talk about?",
-        "That sounds interesting! Tell me more about yourself."
-    ], api_only=False)
-
-@app.local_entrypoint()
-def test_bnb_quantization():
-    """Test BitsAndBytes quantized model"""
-    model_name = "unsloth/Qwen2.5-14B-Instruct-bnb-4bit"
-    print(f"🧪 Testing BnB quantized model: {model_name}")
-    print(f"🗜️ This should now detect BitsAndBytes quantization correctly")
-    print(f"💬 Chat template will be automatically configured")
-    
-    chat_func = get_chat_function(model_name)
-    chat_func.remote(model_name, [
-        "Hello! Testing BitsAndBytes 4-bit quantization.",
-        "What are the benefits of model quantization?",
-        "Thank you for demonstrating quantization!"
-    ], api_only=False)
-
-@app.local_entrypoint()
-def test_gguf_model():
-    """Test GGUF MoE model"""
+def benchmark_llamacpp():
+    """Benchmark llama-cpp performance"""
     model_name = DEFAULT_MODEL
-    print(f"🧪 Testing GGUF MoE model: {model_name}")
-    print(f"🔧 This will automatically select H100 for 18.4B MoE GGUF")
-    print(f"🗜️ GGUF format with built-in quantization")
-    print(f"💬 Chat template will be automatically configured")
+    print(f"🏁 Benchmarking llama-cpp with {model_name}")
+    print(f"📊 Measuring startup time and inference speed")
     
+    start_time = time.time()
     chat_func = get_chat_function(model_name)
+    
+    # Simple benchmark
     chat_func.remote(model_name, [
-        "Hello! Testing GGUF format support with MoE model.",
-        "What is a Mixture of Experts model and how does it work?",
-        "Thank you for demonstrating GGUF format!"
+        "Count from 1 to 10.",
+        "What is 2+2?",
+        "Thank you!"
     ], api_only=False)
-
-@app.local_entrypoint()
-def cleanup_gguf():
-    """Clean up GGUF model - remove unwanted quantizations"""
-    model_name = DEFAULT_MODEL
-    print(f"🧹 Cleaning up GGUF model: {model_name}")
-    print(f"🎯 Will keep only Q8_0 (best quality) and essential files")
-    print(f"🗑️ Will delete other quantization levels to save space")
     
-    result = cleanup_gguf_model.remote(model_name)
-    print(result)
-
-@app.local_entrypoint()
-def redownload_gguf():
-    """Re-download GGUF model with tokenizer files"""
-    model_name = DEFAULT_MODEL
-    print(f"🔄 Re-downloading GGUF model with tokenizer files: {model_name}")
-    print(f"🗑️ First deleting existing model...")
-    
-    # Delete existing model
-    delete_result = delete_model_from_volume.remote(model_name)
-    print(delete_result)
-    
-    print(f"📥 Now downloading with complete tokenizer support...")
-    # Re-download with tokenizer files
-    download_result = download_model_remote.remote(model_name)
-    print(download_result)
-    
-    print(f"📋 Listing downloaded files...")
-    # List files to verify
-    list_result = list_model_files.remote(model_name)
-    print(list_result)
+    total_time = time.time() - start_time
+    print(f"📊 Total benchmark time: {total_time:.1f}s")
 
 @app.local_entrypoint()
 def gpu_specs():
-    """Show GPU specifications and recommended models"""
-    print("🚀 GPU Specifications & Model Recommendations")
-    print("🔗 With FIXED Memory Management, Chat Templates & Quantization Support!")
+    """Show GPU specifications and recommended GGUF models"""
+    print("🚀 GPU Specifications & GGUF Model Recommendations")
+    print("🦙 llama-cpp-python with Q8_0 Quantization Support!")
     print("=" * 80)
     
     specs = [
-        ("T4", "16GB", "1-2B", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"),
-        ("L4", "24GB", "3B, 7B-GPTQ", "Qwen/Qwen2.5-3B-Instruct"),
-        ("A10G", "24GB", "3-6B", "01-ai/Yi-1.5-6B-Chat"),
-        ("L40S", "48GB", "7-9B", "01-ai/Yi-1.5-9B-Chat"),
-        ("A100-40GB", "40GB", "7-13B", "unsloth/llama-2-13b"),
-        ("A100-80GB", "80GB", "13-14B BnB", "unsloth/Qwen2.5-14B-Instruct-bnb-4bit"),
-        ("H100", "80GB", "27-34B GPTQ", "modelscope/Yi-1.5-34B-Chat-GPTQ"),
-        ("H200", "141GB", "34B+", "01-ai/Yi-1.5-34B-Chat"),
-        ("B200", "192GB", "405B", "Meta-Llama-3.1-405B"),
+        ("T4", "16GB", "1-3B GGUF", "microsoft/Phi-3-mini-4k-instruct-gguf"),
+        ("L4", "24GB", "3-7B GGUF", "bartowski/Qwen2.5-7B-Instruct-GGUF"),
+        ("A10G", "24GB", "3-7B GGUF", "bartowski/Llama-3.2-3B-Instruct-GGUF"),
+        ("L40S", "48GB", "7-13B GGUF", "bartowski/Qwen2.5-14B-Instruct-GGUF"),
+        ("A100-80GB", "80GB", "13-27B GGUF", "bartowski/Qwen2.5-32B-Instruct-GGUF"),
+        ("H100", "80GB", "18B MoE GGUF", DEFAULT_MODEL),
+        ("H200", "141GB", "34B+ GGUF", "bartowski/Yi-1.5-34B-Chat-GGUF"),
+        ("B200", "192GB", "70B+ GGUF", "bartowski/Llama-3.1-70B-Instruct-GGUF"),
     ]
     
-    print("\n🔧 GPU | Memory | Model Size | Recommended Example")
+    print("\n🔧 GPU | Memory | Model Size | Recommended GGUF Example")
     print("-" * 80)
     for gpu, memory, models, example in specs:
         print(f"{gpu:8} | {memory:7} | {models:15} | {example}")
     
-    print(f"\n🔗 FIXED Issues:")
-    print(f"  ✅ 34B models now properly assigned to H200")
-    print(f"  ✅ Chat templates auto-configured for RP compatibility")
-    print(f"  ✅ FP8 KV cache disabled for quantized models") 
-    print(f"  ✅ Conservative memory allocation")
-    print(f"  ✅ Batch token validation fixed")
-    print(f"  ✅ BitsAndBytes quantization detection fixed")
-    print(f"  ⚠️ A100-80GB: Max ~14B BnB models recommended")
+    print(f"\n🦙 llama-cpp Advantages:")
+    print(f"  ✅ Native Q8_0 quantization support")
+    print(f"  ✅ Faster startup time (< 30s)")
+    print(f"  ✅ Lower VRAM usage")
+    print(f"  ✅ Better GGUF compatibility")
+    print(f"  ✅ MoE model optimizations")
+    print(f"  ✅ Built-in OpenAI API compatibility")
     
-    print(f"\n💬 RP Compatible Examples:")
-    print(f"  Small:      MODEL_NAME='Qwen/Qwen2.5-3B-Instruct' modal run vllmserver.py::serve_api")
-    print(f"  Medium:     MODEL_NAME='01-ai/Yi-1.5-6B-Chat' modal run vllmserver.py::serve_api")
-    print(f"  Large:      MODEL_NAME='modelscope/Yi-1.5-34B-Chat-GPTQ' modal run vllmserver.py::serve_api")
-    print(f"  BnB Quant:  MODEL_NAME='unsloth/Qwen2.5-14B-Instruct-bnb-4bit' modal run vllmserver.py::serve_api")
-    print(f"  Test:       modal run vllmserver.py::test_bnb_quantization")
+    print(f"\n💬 GGUF Examples:")
+    print(f"  Small:      MODEL_NAME='microsoft/Phi-3-mini-4k-instruct-gguf' modal run vllmserver.py::serve_api")
+    print(f"  Medium:     MODEL_NAME='bartowski/Qwen2.5-7B-Instruct-GGUF' modal run vllmserver.py::serve_api")
+    print(f"  Large MoE:  MODEL_NAME='{DEFAULT_MODEL}' modal run vllmserver.py::serve_api")
+    print(f"  Test Q8:    modal run vllmserver.py::test_gguf_q8")
 
 @app.local_entrypoint()
 def download(model_name: str = None):
-    """Download a model to persistent volume"""
+    """Download a GGUF model to persistent volume"""
     if not model_name:
         model_name = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
     
-    print(f"📥 Downloading model to persistent volume: {model_name}")
-    print(f"🔗 Sharded models will be detected automatically")
-    print(f"💬 Chat template will be configured for RP compatibility")
-    print(f"🗜️ Quantization will be properly detected")
+    if not is_gguf_model(model_name):
+        print("❌ Only GGUF models are supported in llama-cpp mode")
+        print("💡 Try one of these GGUF models:")
+        print("   - microsoft/Phi-3-mini-4k-instruct-gguf")
+        print("   - bartowski/Qwen2.5-7B-Instruct-GGUF")
+        print(f"   - {DEFAULT_MODEL}")
+        return
+    
+    print(f"📥 Downloading GGUF model to persistent volume: {model_name}")
+    print(f"🎯 Will prioritize Q8_0 quantization")
+    print(f"🦙 Optimized for llama-cpp-python")
     result = download_model_remote.remote(model_name)
     print(result)
 
@@ -1648,7 +1042,7 @@ def list_files(model_name: str = None):
     if not model_name:
         model_name = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
     
-    result = list_model_files.remote(model_name)
+    result = list_model_files.remote()
     print(result)
 
 @app.local_entrypoint()
@@ -1667,36 +1061,45 @@ def delete_model(model_name: str = None):
         print("❌ Deletion cancelled")
 
 @app.local_entrypoint()
+def cleanup_gguf():
+    """Clean up GGUF model - remove unwanted quantizations"""
+    model_name = DEFAULT_MODEL
+    print(f"🧹 Cleaning up GGUF model: {model_name}")
+    print(f"🎯 Will keep only Q8_0 (best quality) and essential files")
+    print(f"🗑️ Will delete other quantization levels to save space")
+    
+    result = cleanup_gguf_model.remote(model_name)
+    print(result)
+
+@app.local_entrypoint()
 def info():
     current_model = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
-    gpu_type, gpu_util = get_gpu_config(current_model)
-    vllm_config = get_vllm_config(current_model, gpu_type)
+    gpu_config = get_gpu_config_llamacpp(current_model)
+    gpu_type = gpu_config[0] if len(gpu_config) >= 1 else "L4"
+    memory_util = gpu_config[1] if len(gpu_config) >= 2 else 0.85
     
-    print(f"🚀 vLLM v0.9.1 with FIXED Memory Management, Chat Templates & Quantization:")
+    print(f"🦙 llama-cpp-python v0.2.24 with GGUF Q8_0 Support:")
     print(f"  Model: {current_model}")
-    print(f"  GPU: {gpu_type} ({gpu_util*100}% base memory)")
-    print(f"  Max length: {vllm_config['max_model_len']}")
-    print(f"  Tensor parallel: {vllm_config['tensor_parallel_size']}")
-    print(f"  Max sequences: {vllm_config['max_num_seqs']}")
-    print(f"  Dtype: {vllm_config['dtype']}")
-    if vllm_config['quantization']:
-        print(f"  Quantization: {vllm_config['quantization']}")
+    print(f"  GPU: {gpu_type} ({memory_util*100}% memory)")
+    print(f"  Engine: llama-cpp-python (replaces vLLM)")
+    print(f"  Quantization: GGUF built-in (Q8_0 preferred)")
+    print(f"  Volume: llamacpp-models-storage")
     
-    print(f"\n🔧 All Fixes Applied:")
-    print(f"  ✅ Chat templates for RP compatibility")
-    print(f"  ✅ Dynamic memory reduction for large models")
-    print(f"  ✅ FP8 KV cache (non-quantized only)")
-    print(f"  ✅ Conservative sequence limits")
-    print(f"  ✅ Fixed batch token calculation")
-    print(f"  ✅ Model-size-aware GPU selection")
-    print(f"  ✅ BitsAndBytes/GPTQ/AWQ quantization detection")
+    print(f"\n🔧 Migration Completed:")
+    print(f"  ✅ vLLM completely replaced with llama-cpp")
+    print(f"  ✅ Native Q8_0 quantization support")
+    print(f"  ✅ Faster startup time")
+    print(f"  ✅ Lower VRAM usage")
+    print(f"  ✅ Better GGUF compatibility")
+    print(f"  ✅ MoE model optimizations")
+    print(f"  ✅ OpenAI API compatibility maintained")
     
     print(f"\n📋 Available Commands:")
     print(f"  serve_api               - Run API server indefinitely")
-    print(f"  test_working_model      - Test reliable 3B model")
-    print(f"  test_rp_compatibility   - Test RP setup")
-    print(f"  test_bnb_quantization   - Test BnB quantized model")
-    print(f"  test_medium_model       - Test 6B model")
-    print(f"  gpu_specs              - Show fixed GPU recommendations")
-    print(f"  download                - Download model with chat template")
+    print(f"  test_gguf_q8           - Test Q8_0 quantization")
+    print(f"  test_small_gguf        - Test small GGUF model")
+    print(f"  benchmark_llamacpp     - Performance benchmark")
+    print(f"  gpu_specs              - Show GGUF recommendations")
+    print(f"  download                - Download GGUF model")
+    print(f"  cleanup_gguf           - Clean up quantizations")
     print(f"  info                    - Show this info")

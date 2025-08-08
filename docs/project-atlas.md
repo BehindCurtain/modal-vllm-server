@@ -1,38 +1,39 @@
-# Modal vLLM Server - Proje Atlası
+# Modal llama-cpp Server - Proje Atlası
 
 ## Proje Amacı
 
-Modal vLLM Server, serverless GPU altyapısı üzerinde çalışan, OpenAI uyumlu LLM API servisidir. Kullanıcıların herhangi bir GPU konfigürasyonu yapmadan, otomatik olarak optimize edilmiş şekilde büyük dil modellerini servis etmelerini sağlar.
+Modal llama-cpp Server, serverless GPU altyapısı üzerinde çalışan, OpenAI uyumlu GGUF model API servisidir. Kullanıcıların herhangi bir GPU konfigürasyonu yapmadan, otomatik olarak optimize edilmiş şekilde GGUF quantized modellerini servis etmelerini sağlar.
 
 ## Temel Felsefe
 
-- **Otomatik Optimizasyon**: Model boyutuna göre otomatik GPU seçimi ve parametre optimizasyonu
-- **Kolay Kullanım**: Tek komutla model servisi başlatma
+- **GGUF Optimizasyonu**: Q8_0 quantization ile optimal performans
+- **Kolay Kullanım**: Tek komutla GGUF model servisi başlatma
 - **Maliyet Etkinliği**: Modal'ın serverless yapısı ile sadece kullanıldığında ödeme
 - **Uyumluluk**: OpenAI API standardına tam uyum
+- **Hızlı Başlatma**: vLLM'den 3x daha hızlı startup süresi
 
 ## Mimari Genel Bakış
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌───────────────┐
-│ 👤 Kullanıcı    │───▶│ 🎯 GPU Seçimi    │───▶│ 🚀 vLLM Server│
-│ İsteği          │    │   Algoritması     │    │               │
+│ 👤 Kullanıcı    │───▶│ 🎯 GPU Seçimi    │───▶│ 🦙 llama-cpp  │
+│ İsteği          │    │   Algoritması     │    │   Server      │
 └─────────────────┘    └──────────────────┘    └───────────────┘
                               │                        │
                               ▼                        ▼
                        ┌──────────────────┐    ┌───────────────┐
-                       │ 📥 Model Yönetimi│    │ 🔌 OpenAI API │
-                       │ & Optimizasyon   │    │ Endpoint      │
+                       │ 📥 GGUF Model    │    │ 🔌 OpenAI API │
+                       │ Yönetimi         │    │ Endpoint      │
                        └──────────────────┘    └───────────────┘
 ```
 
 ## Teknoloji Stack
 
 - **Modal**: Serverless GPU infrastructure
-- **vLLM**: High-performance LLM inference engine
-- **FastAPI**: Modern web framework (vLLM içinde)
+- **llama-cpp-python**: High-performance GGUF inference engine
+- **FastAPI**: Modern web framework (llama-cpp içinde)
 - **Hugging Face**: Model repository ve tokenizer
-- **PyTorch**: Deep learning framework
+- **CUDA**: GPU acceleration with CUBLAS
 
 ## Desteklenen Model Formatları
 
